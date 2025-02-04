@@ -6,7 +6,8 @@ from bot import main as bot_main  # Импорт основной функции
 
 def run_flask_server():
     run_autopinger_thread()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Отключаем режим отладки и автоперезагрузку, чтобы избежать ошибки signal
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
 
 if __name__ == '__main__':
     flask_thread = threading.Thread(target=run_flask_server, daemon=True)
