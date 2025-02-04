@@ -2,7 +2,7 @@
 import os
 import os.path
 
-# Определяем абсолютный путь до config.py и создаем его из CONFIG_CONTENT, если он отсутствует
+# Определяем абсолютный путь до config.py и создаем его из CONFIG_CONTENT, если отсутствует
 basedir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(basedir, "config.py")
 
@@ -34,7 +34,7 @@ TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
 GROUP_CHAT_ID = config.GROUP_CHAT_ID
 SELF_URL = config.SELF_URL
 
-# Подключаемся к базе данных
+# Подключаемся к базе данных (файл clients.db должен сохраняться между запусками)
 conn = sqlite3.connect('clients.db', check_same_thread=False)
 cursor = conn.cursor()
 
@@ -76,6 +76,7 @@ def notify_admins(message_text):
 
 @app.route("/click-api/create_invoice", methods=["POST"])
 def create_invoice():
+    # Получаем данные из JSON или form
     data = request.get_json() or request.form
 
     required_fields = ["merchant_trans_id", "amount", "phone_number"]
@@ -144,7 +145,9 @@ def prepare():
 
 @app.route("/click-api/complete", methods=["POST"])
 def complete():
-    required_fields = ["click_trans_id", "merchant_trans_id", "merchant_prepare_id", "amount", "unit_price"]
+    # Обязательные поля – unit_price и quantity мы не требуем, а берем из запроса, если они есть,
+    # иначе из БД
+    required_fields = ["click_trans_id", "merchant_trans_id", "merchant_prepare_id", "amount"]
     for field in required_fields:
         if field not in request.form:
             error_msg = f"Missing field: {field}"
@@ -160,14 +163,29 @@ def complete():
         error_msg = f"Ошибка преобразования amount: {e}"
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
-    try:
-        unit_price = float(request.form["unit_price"])
-    except Exception as e:
-        error_msg = f"Ошибка преобразования unit_price: {e}"
-        app.logger.error(error_msg)
-        return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Если quantity отсутствует, получаем его из БД
+    # Получаем unit_price: сначала пытаемся из запроса, иначе из базы (админ вводит цену в суммах)
+    unit_price_str = request.form.get("unit_price")
+    if unit_price_str:
+        try:
+            unit_price = float(unit_price_str)
+        except Exception as e:
+            error_msg = f"Ошибка преобразования unit_price: {e}"
+            app.logger.error(error_msg)
+            return jsonify({"error": "-8", "error_note": error_msg}), 400
+    else:
+        cursor.execute("SELECT admin_price FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
+        row = cursor.fetchone()
+        if row and row[0]:
+            # admin_price хранится в суммах; преобразуем в тийины (1 сум = 100 тийинов)
+            unit_price = float(row[0]) * 100
+            app.logger.info("unit_price взят из БД и преобразован: %s", unit_price)
+        else:
+            error_msg = "Missing field: unit_price and не удалось извлечь из БД"
+            app.logger.error(error_msg)
+            return jsonify({"error": "-8", "error_note": error_msg}), 400
+
+    # Получаем quantity: сначала из запроса, если нет – из БД
     quantity_str = request.form.get("quantity")
     if quantity_str:
         try:
@@ -181,7 +199,7 @@ def complete():
         row = cursor.fetchone()
         if row and row[0]:
             quantity = row[0]
-            app.logger.info("Количество взято из БД: %s", quantity)
+            app.logger.info("Количество (quantity) взято из БД: %s", quantity)
         else:
             error_msg = "Missing field: quantity and не удалось извлечь из БД"
             app.logger.error(error_msg)
