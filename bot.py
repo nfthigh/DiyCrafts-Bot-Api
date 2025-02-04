@@ -20,7 +20,16 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
-import config  # Импортируем настройки из config.py
+# Если файла config.py нет, создаём его из переменной окружения CONFIG_CONTENT
+if not os.path.exists("config.py"):
+    config_content = os.getenv("CONFIG_CONTENT")
+    if config_content:
+        with open("config.py", "w") as f:
+            f.write(config_content)
+    else:
+        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
+
+import config  # Импортируем настройки
 
 API_TOKEN = config.TELEGRAM_BOT_TOKEN
 ADMIN_CHAT_IDS = config.ADMIN_CHAT_IDS
@@ -329,7 +338,8 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     if not price_text.isdigit():
         await message.reply("Цена должна быть числом.")
         return
-    # Цена вводится в суммах, преобразуем в тийины: 1 сум = 100 тийинов.
+    # Цена вводится в суммах; для фискализации нужно перевести в тийины (1 сум = 100 тийинов),
+    # но для инвойса мы отправляем сумму в суммах.
     admin_price_sum = float(price_text)
     admin_price_tiyin = admin_price_sum * 100
     data = await state.get_data()
@@ -347,12 +357,17 @@ async def process_admin_price(message: types.Message, state: FSMContext):
         await state.clear()
         return
     client_id, product, quantity = result
+    # Итоговая сумма в суммах (без умножения) равна admin_price_sum * quantity
+    total_amount_sum = admin_price_sum * quantity
+    # Итоговая сумма в тийинах для фискализации равна (admin_price_sum*100) * quantity
+    total_amount = admin_price_tiyin * quantity
     inline_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Согласен", callback_data=f"client_accept_order_{order_id}")],
         [InlineKeyboardButton(text="❌ Отменить заказ", callback_data=f"client_cancel_order_{order_id}")]
     ])
     await bot.send_message(client_id, 
-        f"Ваш заказ #{order_id} одобрен!\nЦена за единицу: {admin_price_sum} сум (преобразовано в {admin_price_tiyin} тийинов).\nПодтверждаете заказ?",
+        f"Ваш заказ #{order_id} одобрен!\nЦена за единицу: {admin_price_sum} сум (преобразовано в {admin_price_tiyin} тийинов).\n"
+        f"Итоговая сумма: {total_amount_sum} сум ({total_amount} тийинов).\nПодтверждаете заказ?",
         reply_markup=inline_kb
     )
     await message.reply("Цена отправлена клиенту на подтверждение.")
@@ -370,10 +385,10 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
         await callback_query.message.answer("Ошибка: заказ не найден.")
         return
     admin_price_sum, product, quantity, user_id = result
-    # Преобразуем цену: сумма в суммах умножается на 100 для получения тийинов.
+    # Для фискализации цена переводится в тийины
     unit_price_tiyin = admin_price_sum * 100
     total_amount = unit_price_tiyin * quantity
-    total_amount_sum = total_amount / 100  # для отображения в суммах
+    total_amount_sum = admin_price_sum * quantity
     import uuid
     merchant_trans_id = f"order_{order_id}_{uuid.uuid4().hex[:6]}"
     cursor.execute("UPDATE orders SET merchant_trans_id=? WHERE order_id=?", (merchant_trans_id, order_id))
@@ -384,7 +399,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     BASE_URL = f"{config.SELF_URL}/click-api"
     payload = {
         "merchant_trans_id": merchant_trans_id,
-        "amount": total_amount,  # сумма в тийинах
+        "amount": total_amount_sum,  # Передаем сумму в суммах, как в тестовом примере
         "phone_number": client_phone
     }
     try:
@@ -392,6 +407,9 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
         invoice_response = response.json()
         print("Invoice response:", invoice_response)  # Логируем полный ответ
         payment_url = invoice_response.get("payment_url")
+        if not payment_url and invoice_response.get("invoice_id"):
+            invoice_id = invoice_response["invoice_id"]
+            payment_url = f"https://api.click.uz/pay/invoice/{invoice_id}"
         if not payment_url:
             await callback_query.message.answer("Ошибка создания инвойса. Детали: " + json.dumps(invoice_response))
             return
@@ -402,7 +420,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
         ])
         await callback_query.message.edit_text(
             f"Заказ #{order_id} подтвержден.\nЦена за единицу: {admin_price_sum} сум (преобразовано в {unit_price_tiyin} тийинов).\n"
-            f"Итоговая сумма: {total_amount} тийинов ({total_amount_sum} сум).\nНажмите кнопку ниже для оплаты.",
+            f"Итоговая сумма: {total_amount_sum} сум ({total_amount} тийинов).\nНажмите кнопку ниже для оплаты.",
             reply_markup=inline_kb
         )
     except Exception as e:

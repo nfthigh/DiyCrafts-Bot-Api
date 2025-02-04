@@ -2,7 +2,7 @@
 import threading
 import asyncio
 from payment_api import app, run_autopinger_thread  # Импорт Flask‑сервера и автопинга
-from bot import main as bot_main  # Импорт асинхронной функции main() из bot.py
+from bot import main as bot_main  # Импорт основной функции бота из bot.py
 
 def run_flask_server():
     run_autopinger_thread()

@@ -1,5 +1,15 @@
 # payment_api.py
 import os
+
+# Если файла config.py нет, создаём его из переменной окружения CONFIG_CONTENT
+if not os.path.exists("config.py"):
+    config_content = os.getenv("CONFIG_CONTENT")
+    if config_content:
+        with open("config.py", "w") as f:
+            f.write(config_content)
+    else:
+        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
+
 import time
 import uuid
 import hashlib
@@ -9,21 +19,10 @@ import threading
 import sqlite3
 from flask import Flask, request, jsonify
 from fiscal import create_fiscal_item
-
-# Если файл config.py отсутствует, создаём его из переменной окружения CONFIG_CONTENT:
-if not os.path.exists("config.py"):
-    config_content = os.getenv("CONFIG_CONTENT")
-    if config_content:
-        with open("config.py", "w") as f:
-            f.write(config_content)
-    else:
-        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
-
-import config  # Импорт настроек из config.py
+import config  # Теперь файл config.py точно существует
 
 app = Flask(__name__)
 
-# Используем настройки из config.py
 MERCHANT_USER_ID = config.MERCHANT_USER_ID
 SECRET_KEY = config.SECRET_KEY
 SERVICE_ID = config.SERVICE_ID
@@ -32,7 +31,7 @@ TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
 GROUP_CHAT_ID = config.GROUP_CHAT_ID
 SELF_URL = config.SELF_URL
 
-# Подключаемся к SQLite базе данных
+# Подключаемся к базе данных
 conn = sqlite3.connect('clients.db', check_same_thread=False)
 cursor = conn.cursor()
 
@@ -66,11 +65,7 @@ def generate_auth_header():
 
 def notify_admins(message_text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": GROUP_CHAT_ID,
-        "text": message_text,
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": GROUP_CHAT_ID, "text": message_text, "parse_mode": "HTML"}
     try:
         requests.post(url, data=payload, timeout=10)
     except Exception as e:
@@ -99,7 +94,6 @@ def create_invoice():
         "merchant_trans_id": merchant_trans_id
     }
     try:
-        # Отправляем данные как form data (data=payload)
         resp = requests.post("https://api.click.uz/v2/merchant/invoice/create",
                              headers=headers,
                              data=payload,
