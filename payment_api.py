@@ -1,23 +1,14 @@
 # payment_api.py
 import os
-
-# Если файла config.py нет, создаём его из переменной окружения CONFIG_CONTENT
-if not os.path.exists("config.py"):
-    config_content = os.getenv("CONFIG_CONTENT")
-    if config_content:
-        with open("config.py", "w") as f:
-            f.write(config_content)
-    else:
-        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
-
 import time
 import hashlib
 import json
 import requests
+import threading
 import sqlite3
 from flask import Flask, request, jsonify
 from fiscal import create_fiscal_item
-import config  # Импорт настроек
+import config  # Импорт настроек из config.py
 
 app = Flask(__name__)
 
@@ -67,11 +58,11 @@ def notify_admins(message_text):
     try:
         requests.post(url, data=payload, timeout=10)
     except Exception as e:
-        print("Ошибка отправки уведомления в Telegram:", e)
+        app.logger.error("Ошибка отправки уведомления в Telegram: %s", e)
 
 @app.route("/click-api/create_invoice", methods=["POST"])
 def create_invoice():
-    # Получаем данные из JSON, иначе из form
+    # Сначала пытаемся получить данные из JSON, иначе из form
     data = request.get_json() or request.form
 
     required_fields = ["merchant_trans_id", "amount", "phone_number"]
@@ -102,17 +93,17 @@ def create_invoice():
                              json=payload,
                              timeout=30)
         if resp.status_code != 200:
-            app.logger.error(f"Invoice creation failed: {resp.text}")
+            app.logger.error("Invoice creation failed: %s", resp.text)
             return jsonify({
                 "error": "-9",
                 "error_note": "Invoice creation failed",
                 "http_code": resp.status_code,
                 "response": resp.text
             }), 200
-        app.logger.info("Invoice created: " + json.dumps(resp.json()))
+        app.logger.info("Invoice created: %s", json.dumps(resp.json()))
         return jsonify(resp.json()), 200
     except Exception as e:
-        app.logger.error("Invoice creation exception: " + str(e))
+        app.logger.error("Invoice creation exception: %s", str(e))
         return jsonify({"error": "-9", "error_note": str(e)}), 200
 
 @app.route("/click-api/prepare", methods=["POST"])
@@ -123,7 +114,6 @@ def prepare():
             return jsonify({"error": "-8", "error_note": f"Missing field: {field}"}), 400
     click_trans_id = request.form["click_trans_id"]
     merchant_trans_id = request.form["merchant_trans_id"]
-    amount = float(request.form["amount"])
     # Обновляем запись без использования несуществующей колонки total
     cursor.execute("UPDATE orders SET status=?, cost_info=? WHERE merchant_trans_id=?",
                    ("pending", click_trans_id, merchant_trans_id))
@@ -145,27 +135,59 @@ def complete():
     required_fields = ["click_trans_id", "merchant_trans_id", "merchant_prepare_id", "amount", "product_name", "quantity", "unit_price"]
     for field in required_fields:
         if field not in request.form:
-            return jsonify({"error": "-8", "error_note": f"Missing field: {field}"}), 400
+            error_msg = f"Missing field: {field}"
+            app.logger.error(error_msg)
+            return jsonify({"error": "-8", "error_note": error_msg}), 400
+
     click_trans_id = request.form["click_trans_id"]
     merchant_trans_id = request.form["merchant_trans_id"]
     merchant_prepare_id = request.form["merchant_prepare_id"]
-    amount = float(request.form["amount"])
+    try:
+        amount = float(request.form["amount"])
+    except Exception as e:
+        error_msg = f"Ошибка преобразования amount: {e}"
+        app.logger.error(error_msg)
+        return jsonify({"error": "-8", "error_note": error_msg}), 400
     product_name = request.form["product_name"]
-    quantity = int(request.form["quantity"])
-    unit_price = float(request.form["unit_price"])
+    try:
+        quantity = int(request.form["quantity"])
+    except Exception as e:
+        error_msg = f"Ошибка преобразования quantity: {e}"
+        app.logger.error(error_msg)
+        return jsonify({"error": "-8", "error_note": error_msg}), 400
+    try:
+        unit_price = float(request.form["unit_price"])
+    except Exception as e:
+        error_msg = f"Ошибка преобразования unit_price: {e}"
+        app.logger.error(error_msg)
+        return jsonify({"error": "-8", "error_note": error_msg}), 400
+
+    app.logger.info("Параметры /complete: click_trans_id=%s, merchant_trans_id=%s, amount=%s, product_name=%s, quantity=%s, unit_price=%s",
+                      click_trans_id, merchant_trans_id, amount, product_name, quantity, unit_price)
+
     cursor.execute("SELECT * FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
     order_row = cursor.fetchone()
     if not order_row:
-        return jsonify({"error": "-5", "error_note": "Order not found"}), 404
+        error_msg = "Order not found"
+        app.logger.error(error_msg)
+        return jsonify({"error": "-5", "error_note": error_msg}), 404
     if order_row[-1] == 1:
-        return jsonify({"error": "-4", "error_note": "Already paid"}), 400
+        error_msg = "Already paid"
+        app.logger.error(error_msg)
+        return jsonify({"error": "-4", "error_note": error_msg}), 400
+
     cursor.execute("UPDATE orders SET is_paid=1, status='processing' WHERE merchant_trans_id=?", (merchant_trans_id,))
     conn.commit()
+
     try:
         fiscal_item = create_fiscal_item(product_name, quantity, unit_price)
         fiscal_items = [fiscal_item]
+        app.logger.info("Фискальные данные сформированы: %s", json.dumps(fiscal_items, indent=2, ensure_ascii=False))
     except Exception as e:
-        return jsonify({"error": "-10", "error_note": str(e)}), 400
+        error_msg = f"Ошибка формирования фискальных данных: {e}"
+        app.logger.error(error_msg)
+        return jsonify({"error": "-10", "error_note": error_msg}), 400
+
     fiscal_headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -188,21 +210,18 @@ def complete():
                                       timeout=30)
         if resp_fiscal.status_code == 200:
             fiscal_result = resp_fiscal.json()
+            app.logger.info("Фискальные данные отправлены, ответ: %s", json.dumps(fiscal_result, indent=2, ensure_ascii=False))
         else:
             fiscal_result = {"error_code": -1, "raw": resp_fiscal.text}
+            app.logger.error("Ошибка фискализации, статус %s: %s", resp_fiscal.status_code, resp_fiscal.text)
     except Exception as e:
         fiscal_result = {"error_code": -1, "error_note": str(e)}
-    notification_message = (
-        "💰 <b>Оплата прошла успешно!</b> 💰\n\n"
-        f"✅ Заказ <b>{merchant_trans_id}</b> оплачен.\n"
-        f"📦 Товар: <b>{product_name}</b>\n"
-        f"🔢 Количество: <b>{quantity}</b>\n"
-        f"💸 Цена за единицу: <b>{unit_price/100}</b> сум (преобразовано в {unit_price} тийинов)\n"
-        f"🧾 Итоговая сумма: <b>{amount}</b> тийинов\n\n"
-        "📄 Фискальные данные:\n"
-        f"<pre>{json.dumps(fiscal_items, indent=2, ensure_ascii=False)}</pre>"
-    )
-    notify_admins(notification_message)
+        app.logger.error("Исключение при фискализации: %s", e)
+
+    # Обновляем статус заказа на "completed"
+    cursor.execute("UPDATE orders SET status='completed' WHERE merchant_trans_id=?", (merchant_trans_id,))
+    conn.commit()
+
     response = {
         "click_trans_id": click_trans_id,
         "merchant_trans_id": merchant_trans_id,
@@ -212,7 +231,26 @@ def complete():
         "fiscal_items": fiscal_items,
         "fiscal_response": fiscal_result
     }
+    app.logger.info("Ответ /complete отправлен: %s", json.dumps(response, indent=2, ensure_ascii=False))
     return jsonify(response)
+
+def auto_ping():
+    """
+    Функция автопинга для поддержания активности инстанса на Render.com.
+    Каждые 4 минуты отправляет GET-запрос к SELF_URL.
+    """
+    while True:
+        try:
+            app.logger.info("Auto-ping: отправка запроса к %s", SELF_URL)
+            requests.get(SELF_URL, timeout=10)
+        except Exception as e:
+            app.logger.error("Auto-ping error: %s", e)
+        # Пауза 4 минуты (240 секунд)
+        time.sleep(240)
+
+# Запускаем автопинг в отдельном потоке
+ping_thread = threading.Thread(target=auto_ping, daemon=True)
+ping_thread.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)

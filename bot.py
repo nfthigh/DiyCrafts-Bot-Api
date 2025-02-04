@@ -18,11 +18,15 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
-# Если файла config.py нет, создаём его из переменной окружения CONFIG_CONTENT
-if not os.path.exists("config.py"):
+# Определяем абсолютный путь до config.py
+import os
+basedir = os.path.dirname(os.path.abspath(__file__))
+config_path = os.path.join(basedir, "config.py")
+
+if not os.path.exists(config_path):
     config_content = os.getenv("CONFIG_CONTENT")
     if config_content:
-        with open("config.py", "w") as f:
+        with open(config_path, "w") as f:
             f.write(config_content)
     else:
         raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
@@ -32,6 +36,7 @@ import config  # Импорт настроек
 API_TOKEN = config.TELEGRAM_BOT_TOKEN
 ADMIN_CHAT_IDS = config.ADMIN_CHAT_IDS
 GROUP_CHAT_ID = config.GROUP_CHAT_ID
+# SELF_URL здесь используется для обращения к серверу на Render
 SELF_URL = config.SELF_URL
 
 logging.basicConfig(level=logging.INFO)
@@ -339,8 +344,6 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     if not price_text.isdigit():
         await message.reply("Цена должна быть числом.")
         return
-    # Цена вводится в суммах; для инвойса передаем сумму как есть,
-    # а для фискализации цена переводится в тийины (1 сум = 100 тийинов)
     admin_price_sum = float(price_text)
     admin_price_tiyin = admin_price_sum * 100
     data = await state.get_data()
@@ -358,7 +361,7 @@ async def process_admin_price(message: types.Message, state: FSMContext):
         await state.clear()
         return
     client_id, product, quantity = result
-    total_amount_sum = admin_price_sum * quantity  # итоговая сумма в суммах для инвойса
+    total_amount_sum = admin_price_sum * quantity
     inline_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Согласен", callback_data=f"client_accept_order_{order_id}")],
         [InlineKeyboardButton(text="❌ Отменить заказ", callback_data=f"client_cancel_order_{order_id}")]
@@ -386,7 +389,6 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     unit_price_tiyin = admin_price_sum * 100
     total_amount_sum = admin_price_sum * quantity
     import uuid
-    # Генерация merchant_trans_id как UUID
     merchant_trans_id = str(uuid.uuid4())
     cursor.execute("UPDATE orders SET merchant_trans_id=? WHERE order_id=?", (merchant_trans_id, order_id))
     conn.commit()
@@ -396,13 +398,13 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     BASE_URL = f"{config.SELF_URL}/click-api"
     payload = {
         "merchant_trans_id": merchant_trans_id,
-        "amount": total_amount_sum,  # передаем сумму в суммах
+        "amount": total_amount_sum,
         "phone_number": client_phone
     }
     try:
         response = requests.post(f"{BASE_URL}/create_invoice", json=payload, timeout=30)
         invoice_response = response.json()
-        print("Invoice response:", invoice_response)  # логирование полного ответа
+        print("Invoice response:", invoice_response)
         payment_url = invoice_response.get("payment_url")
         if not payment_url and invoice_response.get("invoice_id"):
             invoice_id = invoice_response["invoice_id"]
