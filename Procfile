@@ -1,1 +1,1 @@
-web: python payment_api.py
+web: python main.py

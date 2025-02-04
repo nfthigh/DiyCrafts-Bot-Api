@@ -1,34 +1,32 @@
-# main.py
+# payment_api.py
 import os
-import threading
 import time
-import asyncio
-import sqlite3
-import logging
-from flask import Flask, request, jsonify
+import uuid
+import hashlib
+import json
 import requests
-import config  # Ваш конфигурационный файл
-
-# Импортируем необходимые модули для Flask-сервера
+import threading
+import sqlite3
+from flask import Flask, request, jsonify
 from fiscal import create_fiscal_item
+import config  # Импорт настроек из config.py
 
-# Настройка Flask-приложения
 app = Flask(__name__)
 
-# Настройки из config.py
+# Используем настройки из config.py
 MERCHANT_USER_ID = config.MERCHANT_USER_ID
 SECRET_KEY = config.SECRET_KEY
 SERVICE_ID = config.SERVICE_ID
-PHONE_NUMBER = config.PHONE_NUMBER
+PHONE_NUMBER = config.PHONE_NUMBER  # не используется, т.к. номер берется из базы
 TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
 GROUP_CHAT_ID = config.GROUP_CHAT_ID
 SELF_URL = config.SELF_URL
 
-# Подключение к базе данных (один и тот же файл для веб-сервиса и бота)
+# Подключаемся к SQLite базе данных (один и тот же файл для бота и сервера)
 conn = sqlite3.connect('clients.db', check_same_thread=False)
 cursor = conn.cursor()
 
-# Создаем таблицы (если их еще нет)
+# Создаем таблицу orders (если её нет)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS orders (
     order_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,13 +44,13 @@ CREATE TABLE IF NOT EXISTS orders (
     delivery_comment TEXT,
     admin_price REAL,
     payment_url TEXT,
-    is_paid INTEGER DEFAULT 0
+    is_paid INTEGER DEFAULT 0,
+    FOREIGN KEY (user_id) REFERENCES clients (user_id)
 )
 """)
 conn.commit()
 
 def generate_auth_header():
-    import time, hashlib
     timestamp = str(int(time.time()))
     digest = hashlib.sha1((timestamp + SECRET_KEY).encode('utf-8')).hexdigest()
     return f"{MERCHANT_USER_ID}:{digest}:{timestamp}"

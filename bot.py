@@ -42,7 +42,7 @@ dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-# Подключаемся к базе данных (используем тот же файл, что и для payment_api)
+# Подключаемся к базе данных (тот же файл, что и для payment_api)
 conn = sqlite3.connect('clients.db', check_same_thread=False)
 cursor = conn.cursor()
 
