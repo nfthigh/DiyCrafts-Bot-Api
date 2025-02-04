@@ -338,8 +338,7 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     if not price_text.isdigit():
         await message.reply("Цена должна быть числом.")
         return
-    # Цена вводится в суммах; для фискализации нужно перевести в тийины (1 сум = 100 тийинов),
-    # но для инвойса мы отправляем сумму в суммах.
+    # Цена вводится в суммах; для создания инвойса сумма передается как есть, а для фискализации переводится в тийины
     admin_price_sum = float(price_text)
     admin_price_tiyin = admin_price_sum * 100
     data = await state.get_data()
@@ -357,17 +356,15 @@ async def process_admin_price(message: types.Message, state: FSMContext):
         await state.clear()
         return
     client_id, product, quantity = result
-    # Итоговая сумма в суммах (без умножения) равна admin_price_sum * quantity
-    total_amount_sum = admin_price_sum * quantity
-    # Итоговая сумма в тийинах для фискализации равна (admin_price_sum*100) * quantity
-    total_amount = admin_price_tiyin * quantity
+    total_amount_sum = admin_price_sum * quantity  # итоговая сумма в суммах
+    total_amount = total_amount_sum  # для создания инвойса передаем сумму в суммах (как в тестовом примере)
     inline_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Согласен", callback_data=f"client_accept_order_{order_id}")],
         [InlineKeyboardButton(text="❌ Отменить заказ", callback_data=f"client_cancel_order_{order_id}")]
     ])
     await bot.send_message(client_id, 
         f"Ваш заказ #{order_id} одобрен!\nЦена за единицу: {admin_price_sum} сум (преобразовано в {admin_price_tiyin} тийинов).\n"
-        f"Итоговая сумма: {total_amount_sum} сум ({total_amount} тийинов).\nПодтверждаете заказ?",
+        f"Итоговая сумма: {total_amount_sum} сум ({total_amount} сум для инвойса).\nПодтверждаете заказ?",
         reply_markup=inline_kb
     )
     await message.reply("Цена отправлена клиенту на подтверждение.")
@@ -385,7 +382,6 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
         await callback_query.message.answer("Ошибка: заказ не найден.")
         return
     admin_price_sum, product, quantity, user_id = result
-    # Для фискализации цена переводится в тийины
     unit_price_tiyin = admin_price_sum * 100
     total_amount = unit_price_tiyin * quantity
     total_amount_sum = admin_price_sum * quantity
@@ -399,7 +395,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     BASE_URL = f"{config.SELF_URL}/click-api"
     payload = {
         "merchant_trans_id": merchant_trans_id,
-        "amount": total_amount_sum,  # Передаем сумму в суммах, как в тестовом примере
+        "amount": total_amount_sum,  # Передаем сумму в суммах
         "phone_number": client_phone
     }
     try:
@@ -411,7 +407,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
             invoice_id = invoice_response["invoice_id"]
             payment_url = f"https://api.click.uz/pay/invoice/{invoice_id}"
         if not payment_url:
-           await callback_query.message.answer("Ошибка создания инвойса. Детали: " + json.dumps(invoice_response), parse_mode=None)
+            await callback_query.message.answer("Ошибка создания инвойса. Детали: " + json.dumps(invoice_response), parse_mode=None)
             return
         cursor.execute("UPDATE orders SET payment_url=? WHERE order_id=?", (payment_url, order_id))
         conn.commit()
@@ -424,7 +420,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
             reply_markup=inline_kb
         )
     except Exception as e:
-        await callback_query.message.answer(f"Ошибка при создании инвойса: {e}")
+        await callback_query.message.answer(f"Ошибка при создании инвойса: {e}", parse_mode=None)
 
 @router.callback_query(lambda c: c.data and c.data.startswith("client_cancel_order_"))
 async def client_cancel_order(callback_query: types.CallbackQuery, state: FSMContext):
