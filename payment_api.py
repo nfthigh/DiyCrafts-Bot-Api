@@ -1,5 +1,16 @@
 # payment_api.py
 import os
+# Определяем абсолютный путь до каталога текущего файла
+basedir = os.path.dirname(os.path.abspath(__file__))
+config_path = os.path.join(basedir, "config.py")
+
+if not os.path.exists(config_path):
+    config_content = os.getenv("CONFIG_CONTENT")
+    if config_content:
+        with open(config_path, "w") as f:
+            f.write(config_content)
+    else:
+        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
 import time
 import hashlib
 import json
