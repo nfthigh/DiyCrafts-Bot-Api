@@ -78,7 +78,7 @@ def create_invoice():
         if field not in request.form:
             return jsonify({"error": "-8", "error_note": f"Missing field: {field}"}), 400
     merchant_trans_id = request.form["merchant_trans_id"]
-    # При создании инвойса сумма передается так, как получена (в суммах)
+    # Сумма передается как есть (в суммах)
     amount = float(request.form["amount"])
     phone_number = request.form["phone_number"]
     headers = {

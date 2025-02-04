@@ -357,15 +357,14 @@ async def process_admin_price(message: types.Message, state: FSMContext):
         await state.clear()
         return
     client_id, product, quantity = result
-    total_amount_sum = admin_price_sum * quantity  # итоговая сумма в суммах (без умножения)
-    total_amount = total_amount_sum  # для создания инвойса передаем сумму в суммах
+    total_amount_sum = admin_price_sum * quantity  # итоговая сумма в суммах
     inline_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Согласен", callback_data=f"client_accept_order_{order_id}")],
         [InlineKeyboardButton(text="❌ Отменить заказ", callback_data=f"client_cancel_order_{order_id}")]
     ])
     await bot.send_message(client_id, 
         f"Ваш заказ #{order_id} одобрен!\nЦена за единицу: {admin_price_sum} сум (преобразовано в {admin_price_tiyin} тийинов).\n"
-        f"Итоговая сумма: {total_amount_sum} сум (для инвойса: {total_amount} сум).\nПодтверждаете заказ?",
+        f"Итоговая сумма: {total_amount_sum} сум (для инвойса: {total_amount_sum} сум).\nПодтверждаете заказ?",
         reply_markup=inline_kb
     )
     await message.reply("Цена отправлена клиенту на подтверждение.")
@@ -402,7 +401,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     try:
         response = requests.post(f"{BASE_URL}/create_invoice", json=payload, timeout=30)
         invoice_response = response.json()
-        print("Invoice response:", invoice_response)  # Логируем полный ответ
+        print("Invoice response:", invoice_response)  # логирование полного ответа
         payment_url = invoice_response.get("payment_url")
         if not payment_url and invoice_response.get("invoice_id"):
             invoice_id = invoice_response["invoice_id"]
