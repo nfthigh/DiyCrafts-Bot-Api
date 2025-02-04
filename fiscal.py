@@ -7,21 +7,21 @@ def create_fiscal_item(product_name: str, quantity: int, unit_price: float) -> d
     
     :param product_name: Название товара (например, "Кружка")
     :param quantity: Количество товара
-    :param unit_price: Цена за единицу, заданная администратором
+    :param unit_price: Цена за единицу, введённая администратором (в тийинах)
     :return: Словарь с фискальными данными
     """
     product = products_data.get(product_name)
     if not product:
         raise ValueError(f"Товар '{product_name}' не найден")
     price_total = unit_price * quantity
-    # Пример расчета НДС: если сумма включает НДС 12%
+    # Пример расчёта НДС (если сумма включает 12% НДС)
     vat = round((price_total / 1.12) * 0.12)
     fiscal_item = {
         "Name": product_name,
         "SPIC": product["SPIC"],
         "PackageCode": product["PackageCode"],
-        "GoodPrice": unit_price,   # Цена за единицу (админская)
-        "Price": price_total,        # Общая стоимость
+        "GoodPrice": unit_price,  # Цена за единицу (в тийинах)
+        "Price": price_total,
         "Amount": quantity,
         "VAT": vat,
         "VATPercent": 12,
@@ -29,7 +29,6 @@ def create_fiscal_item(product_name: str, quantity: int, unit_price: float) -> d
     }
     return fiscal_item
 
-# Тестовый вызов (при необходимости)
+# Тестовый вызов
 if __name__ == "__main__":
-    item = create_fiscal_item("Кружка", 2, 50000)
-    print(item)
+    print(create_fiscal_item("Кружка", 2, 50000 * 100))  # Например, 50000 сум -> 5000000 тийинов

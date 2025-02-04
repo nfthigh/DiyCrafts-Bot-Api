@@ -10,6 +10,8 @@ import time
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, types, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ChatType
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -17,7 +19,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
-import config  # Импортируем настройки из config.py
+import config  # Импорт настроек из config.py
 
 API_TOKEN = config.TELEGRAM_BOT_TOKEN
 ADMIN_CHAT_IDS = config.ADMIN_CHAT_IDS
@@ -27,8 +29,14 @@ SELF_URL = config.SELF_URL
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Создаем объект бота, передавая параметры по умолчанию в виде словаря
-bot = Bot(token=API_TOKEN, default={"parse_mode": "HTML"})
+bot = Bot(
+    token=API_TOKEN,
+    default=DefaultBotProperties(
+        parse_mode="HTML",
+        link_preview_is_disabled=False,
+        protect_content=False
+    )
+)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
@@ -118,7 +126,7 @@ async def send_welcome(message: types.Message, state: FSMContext):
     cursor.execute("SELECT name, contact, username FROM clients WHERE user_id=?", (user_id,))
     client = cursor.fetchone()
     is_admin = user_id in ADMIN_CHAT_IDS
-    if message.chat.type != types.ChatType.PRIVATE:
+    if message.chat.type != ChatType.PRIVATE:
         await message.reply("Пожалуйста, напишите мне в личные сообщения для регистрации.")
         return
     if client:
@@ -312,8 +320,8 @@ async def approve_order(callback_query: types.CallbackQuery, state: FSMContext):
     cursor.execute("UPDATE orders SET status='Ожидание цены' WHERE order_id=?", (order_id,))
     conn.commit()
     await state.update_data(order_id=order_id)
-    await callback_query.message.answer(f"Введите цену за единицу для заказа #{order_id} (тийины):")
-    await AdminPriceState.waiting_for_price.set()
+    await callback_query.message.answer(f"Введите цену за единицу для заказа #{order_id} (в суммах):")
+    await state.set_state(AdminPriceState.waiting_for_price)
 
 @router.message(AdminPriceState.waiting_for_price)
 async def process_admin_price(message: types.Message, state: FSMContext):
@@ -321,14 +329,17 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     if not price_text.isdigit():
         await message.reply("Цена должна быть числом.")
         return
-    admin_price = float(price_text)
+    # Админ вводит цену в суммах, а нам нужно преобразовать в тийины:
+    admin_price_sum = float(price_text)
+    # Преобразуем: 1 сум = 100 тийинов
+    admin_price_tiyin = admin_price_sum * 100
     data = await state.get_data()
     order_id = data.get('order_id')
     if not order_id:
         await message.reply("Ошибка: заказ не найден.")
         await state.clear()
         return
-    cursor.execute("UPDATE orders SET admin_price=? WHERE order_id=?", (admin_price, order_id))
+    cursor.execute("UPDATE orders SET admin_price=? WHERE order_id=?", (admin_price_sum, order_id))
     conn.commit()
     cursor.execute("SELECT user_id, product, quantity FROM orders WHERE order_id=?", (order_id,))
     result = cursor.fetchone()
@@ -341,7 +352,10 @@ async def process_admin_price(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="✅ Согласен", callback_data=f"client_accept_order_{order_id}")],
         [InlineKeyboardButton(text="❌ Отменить заказ", callback_data=f"client_cancel_order_{order_id}")]
     ])
-    await bot.send_message(client_id, f"Ваш заказ #{order_id} одобрен!\nЦена за единицу: {admin_price} тийинов.\nПодтверждаете заказ?", reply_markup=inline_kb)
+    await bot.send_message(client_id, 
+        f"Ваш заказ #{order_id} одобрен!\nЦена за единицу: {admin_price_sum} сум (преобразовано в {admin_price_tiyin} тийинов).\nПодтверждаете заказ?",
+        reply_markup=inline_kb
+    )
     await message.reply("Цена отправлена клиенту на подтверждение.")
     await state.clear()
 
@@ -356,14 +370,14 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     if not result:
         await callback_query.message.answer("Ошибка: заказ не найден.")
         return
-    admin_price, product, quantity, user_id = result
-    total_amount = admin_price * quantity
+    admin_price_sum, product, quantity, user_id = result
+    # Преобразуем цену: введенная сумма (в суммах) умножается на 100 для получения тийинов
+    unit_price_tiyin = admin_price_sum * 100
+    total_amount = unit_price_tiyin * quantity
     import uuid
     merchant_trans_id = f"order_{order_id}_{uuid.uuid4().hex[:6]}"
-    # Обновляем поле merchant_trans_id
     cursor.execute("UPDATE orders SET merchant_trans_id=? WHERE order_id=?", (merchant_trans_id, order_id))
     conn.commit()
-    # Получаем номер телефона клиента из таблицы clients
     cursor.execute("SELECT contact FROM clients WHERE user_id=?", (user_id,))
     client_data = cursor.fetchone()
     client_phone = client_data[0] if client_data and client_data[0] else ""
@@ -386,7 +400,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
             [InlineKeyboardButton(text="💳 Оплатить", url=payment_url)]
         ])
         await callback_query.message.edit_text(
-            f"Заказ #{order_id} подтвержден.\nЦена за единицу: {admin_price} тийинов.\nНажмите кнопку ниже для оплаты.",
+            f"Заказ #{order_id} подтвержден.\nЦена за единицу: {admin_price_sum} сум (преобразовано в {unit_price_tiyin} тийинов).\nНажмите кнопку ниже для оплаты.",
             reply_markup=inline_kb
         )
     except Exception as e:
@@ -417,7 +431,6 @@ async def reject_order(callback_query: types.CallbackQuery):
         await bot.send_message(client_id, f"Ваш заказ #{order_id} отклонён.")
     await callback_query.answer("Заказ отклонён.", show_alert=True)
 
-# Автопинг для бота, чтобы Render не отключал его
 def bot_autopinger():
     while True:
         time.sleep(300)

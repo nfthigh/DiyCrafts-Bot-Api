@@ -9,7 +9,7 @@ import threading
 import sqlite3
 from flask import Flask, request, jsonify
 from fiscal import create_fiscal_item
-import config  # Импорт настроек из config.py
+import config  # Импортируем настройки из config.py
 
 app = Flask(__name__)
 
@@ -17,16 +17,16 @@ app = Flask(__name__)
 MERCHANT_USER_ID = config.MERCHANT_USER_ID
 SECRET_KEY = config.SECRET_KEY
 SERVICE_ID = config.SERVICE_ID
-PHONE_NUMBER = config.PHONE_NUMBER
+PHONE_NUMBER = config.PHONE_NUMBER  # не используется, номер берется из данных клиента
 TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
 GROUP_CHAT_ID = config.GROUP_CHAT_ID
 SELF_URL = config.SELF_URL
 
-# Подключаемся к SQLite базе данных (используется один и тот же файл, что и бот)
+# Подключаемся к SQLite базе данных (используем ту же базу, что и бот)
 conn = sqlite3.connect('clients.db', check_same_thread=False)
 cursor = conn.cursor()
 
-# Убедимся, что таблица orders имеет все необходимые столбцы
+# Создаем таблицу orders, если её нет
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS orders (
     order_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,11 +110,9 @@ def prepare():
     click_trans_id = request.form["click_trans_id"]
     merchant_trans_id = request.form["merchant_trans_id"]
     amount = float(request.form["amount"])
-    # Обновляем заказ в базе по merchant_trans_id
     cursor.execute("UPDATE orders SET total=?, status=?, cost_info=? WHERE merchant_trans_id=?",
                    (amount, "pending", click_trans_id, merchant_trans_id))
     if cursor.rowcount == 0:
-        # Если заказ не найден, можно вставить новый (обычно заказ создаётся ботом)
         cursor.execute("INSERT INTO orders (merchant_trans_id, total, status, cost_info) VALUES (?, ?, ?, ?)",
                        (merchant_trans_id, amount, "pending", click_trans_id))
     conn.commit()
@@ -145,11 +143,9 @@ def complete():
     order_row = cursor.fetchone()
     if not order_row:
         return jsonify({"error": "-5", "error_note": "Order not found"}), 404
-    # order_row[-1] is is_paid
     if order_row[-1] == 1:
         return jsonify({"error": "-4", "error_note": "Already paid"}), 400
 
-    # Обновляем заказ
     cursor.execute("UPDATE orders SET is_paid=1, status='processing' WHERE merchant_trans_id=?", (merchant_trans_id,))
     conn.commit()
 
@@ -189,7 +185,7 @@ def complete():
         f"✅ Заказ <b>{merchant_trans_id}</b> оплачен.\n"
         f"📦 Товар: <b>{product_name}</b>\n"
         f"🔢 Количество: <b>{quantity}</b>\n"
-        f"💸 Цена за единицу: <b>{unit_price}</b> тийинов\n"
+        f"💸 Цена за единицу: <b>{unit_price/100}</b> сум (преобразовано в {unit_price} тийинов)\n"
         f"🧾 Итоговая сумма: <b>{amount}</b> тийинов\n\n"
         "📄 Фискальные данные:\n"
         f"<pre>{json.dumps(fiscal_items, indent=2, ensure_ascii=False)}</pre>"
