@@ -1,14 +1,5 @@
 # bot.py
 import os
-
-if not os.path.exists("config.py"):
-    config_content = os.getenv("CONFIG_CONTENT")
-    if config_content:
-        with open("config.py", "w") as f:
-            f.write(config_content)
-    else:
-        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
-
 import logging
 import asyncio
 import sqlite3
@@ -337,7 +328,7 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     if not price_text.isdigit():
         await message.reply("Цена должна быть числом.")
         return
-    # Админ вводит цену в суммах; преобразуем в тийины: 1 сум = 100 тийинов.
+    # Цена вводится в суммах, преобразуем в тийины (1 сум = 100 тийинов)
     admin_price_sum = float(price_text)
     admin_price_tiyin = admin_price_sum * 100
     data = await state.get_data()

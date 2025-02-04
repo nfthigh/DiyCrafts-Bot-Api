@@ -1,14 +1,5 @@
 # payment_api.py
 import os
-
-if not os.path.exists("config.py"):
-    config_content = os.getenv("CONFIG_CONTENT")
-    if config_content:
-        with open("config.py", "w") as f:
-            f.write(config_content)
-    else:
-        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
-
 import time
 import uuid
 import hashlib
@@ -26,16 +17,16 @@ app = Flask(__name__)
 MERCHANT_USER_ID = config.MERCHANT_USER_ID
 SECRET_KEY = config.SECRET_KEY
 SERVICE_ID = config.SERVICE_ID
-PHONE_NUMBER = config.PHONE_NUMBER  # не используется, т.к. номер берется из базы
+PHONE_NUMBER = config.PHONE_NUMBER
 TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
 GROUP_CHAT_ID = config.GROUP_CHAT_ID
 SELF_URL = config.SELF_URL
 
-# Подключаемся к SQLite базе данных (один и тот же файл для бота и сервера)
+# Подключаемся к SQLite базе данных (тот же файл, что и у бота)
 conn = sqlite3.connect('clients.db', check_same_thread=False)
 cursor = conn.cursor()
 
-# Создаем таблицу orders (если её нет)
+# Создаем таблицу orders, если её нет
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS orders (
     order_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,8 +90,11 @@ def create_invoice():
         "merchant_trans_id": merchant_trans_id
     }
     try:
+        # Используем data=payload, чтобы отправить form data, как в вашем примере
         resp = requests.post("https://api.click.uz/v2/merchant/invoice/create",
-                             headers=headers, json=payload, timeout=30)
+                             headers=headers,
+                             data=payload,
+                             timeout=30)
         if resp.status_code != 200:
             return jsonify({"error": "-9", "error_note": "Invoice creation failed", "http_code": resp.status_code, "response": resp.text}), 200
         return jsonify(resp.json()), 200
@@ -174,7 +168,9 @@ def complete():
     }
     try:
         resp_fiscal = requests.post("https://api.click.uz/v2/merchant/payment/ofd_data/submit_items",
-                                      headers=fiscal_headers, json=fiscal_payload, timeout=30)
+                                      headers=fiscal_headers,
+                                      json=fiscal_payload,
+                                      timeout=30)
         if resp_fiscal.status_code == 200:
             fiscal_result = resp_fiscal.json()
         else:
