@@ -19,7 +19,6 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
 # Определяем абсолютный путь до config.py
-import os
 basedir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(basedir, "config.py")
 
@@ -36,8 +35,7 @@ import config  # Импорт настроек
 API_TOKEN = config.TELEGRAM_BOT_TOKEN
 ADMIN_CHAT_IDS = config.ADMIN_CHAT_IDS
 GROUP_CHAT_ID = config.GROUP_CHAT_ID
-# SELF_URL здесь используется для обращения к серверу на Render
-SELF_URL = config.SELF_URL
+SELF_URL = config.SELF_URL  # Адрес вашего сервера на Render
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -55,7 +53,7 @@ dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-# Подключаемся к базе данных (тот же файл, что и для payment_api)
+# Подключаемся к базе данных
 conn = sqlite3.connect('clients.db', check_same_thread=False)
 cursor = conn.cursor()
 
@@ -133,14 +131,20 @@ def get_product_keyboard():
 
 @router.message(Command("start"))
 async def send_welcome(message: types.Message, state: FSMContext):
+    """
+    Точка входа. Если клиент уже зарегистрирован, сразу предлагаем выбрать продукт.
+    Иначе просим контакт.
+    """
     await state.clear()
     user_id = message.from_user.id
     cursor.execute("SELECT name, contact, username FROM clients WHERE user_id=?", (user_id,))
     client = cursor.fetchone()
     is_admin = user_id in ADMIN_CHAT_IDS
+
     if message.chat.type != ChatType.PRIVATE:
         await message.reply("Пожалуйста, напишите мне в личные сообщения для регистрации.")
         return
+
     if client:
         user_name = client[0] if client[0] else "Неизвестный"
         welcome_message = f"👋 Добро пожаловать, {user_name}! Выберите опцию:"
@@ -157,6 +161,9 @@ async def send_welcome(message: types.Message, state: FSMContext):
 
 @router.message(StateFilter(OrderForm.contact), F.content_type == types.ContentType.CONTACT)
 async def register_contact(message: types.Message, state: FSMContext):
+    """
+    Сохраняем контакт в памяти FSM, затем просим имя.
+    """
     user_contact = message.contact.phone_number
     await state.update_data(contact=user_contact)
     builder = ReplyKeyboardBuilder()
@@ -167,10 +174,16 @@ async def register_contact(message: types.Message, state: FSMContext):
 
 @router.message(StateFilter(OrderForm.contact))
 async def handle_contact_prompt(message: types.Message):
-    await message.reply("Пожалуйста, отправьте свой контакт.")
+    """
+    Если пользователь присылает не контакт, просим его ещё раз.
+    """
+    await message.reply("Пожалуйста, отправьте свой контакт, воспользовавшись кнопкой '📞 Отправить контакт'.")
 
 @router.message(StateFilter(OrderForm.name))
 async def register_name(message: types.Message, state: FSMContext):
+    """
+    Сохраняем имя в базе и переводим пользователя к выбору продукта.
+    """
     if not message.text:
         await message.reply("Пожалуйста, введите ваше имя.")
         return
@@ -178,25 +191,34 @@ async def register_name(message: types.Message, state: FSMContext):
     if not user_name:
         await message.reply("Имя не может быть пустым.")
         return
-    await state.update_data(name=user_name)
+
     user_id = message.from_user.id
     user_username = message.from_user.username or "Не указан"
+
     data = await state.get_data()
     contact = data.get('contact')
+
     cursor.execute("""
         INSERT INTO clients (user_id, username, contact, name)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, contact=excluded.contact, name=excluded.name
     """, (user_id, user_username, contact, user_name))
     conn.commit()
+
     await state.clear()
     is_admin = user_id in ADMIN_CHAT_IDS
-    await message.answer(f"🎉 Спасибо за регистрацию, {user_name}!", reply_markup=get_main_keyboard(is_admin, True))
+    await message.answer(
+        f"🎉 Спасибо за регистрацию, {user_name}!",
+        reply_markup=get_main_keyboard(is_admin, True)
+    )
     await message.answer("Выберите продукт:", reply_markup=get_product_keyboard())
     await state.set_state(OrderForm.product)
 
 @router.callback_query(lambda c: c.data and c.data.startswith('product_'), StateFilter(OrderForm.product))
 async def process_product_selection(callback_query: types.CallbackQuery, state: FSMContext):
+    """
+    Сохраняем выбранный продукт, затем просим количество.
+    """
     await callback_query.answer()
     product = callback_query.data.split('_', 1)[1]
     await state.update_data(product=product)
@@ -208,10 +230,14 @@ async def process_product_selection(callback_query: types.CallbackQuery, state: 
 
 @router.message(StateFilter(OrderForm.quantity))
 async def handle_quantity(message: types.Message, state: FSMContext):
+    """
+    Сохраняем количество, затем просим надпись для дизайна.
+    """
     quantity = message.text.strip()
     if not quantity.isdigit() or int(quantity) <= 0:
         await message.reply("Укажите корректное количество.")
         return
+
     await state.update_data(quantity=int(quantity))
     builder = ReplyKeyboardBuilder()
     builder.button(text='❌ Отменить')
@@ -221,6 +247,9 @@ async def handle_quantity(message: types.Message, state: FSMContext):
 
 @router.message(StateFilter(OrderForm.text_design))
 async def handle_text_design(message: types.Message, state: FSMContext):
+    """
+    Сохраняем надпись, предлагаем добавить фото.
+    """
     design_text = message.text.strip()
     await state.update_data(design_text=design_text)
     builder = InlineKeyboardBuilder()
@@ -232,6 +261,9 @@ async def handle_text_design(message: types.Message, state: FSMContext):
 
 @router.callback_query(lambda c: c.data == 'skip_photo', StateFilter(OrderForm.photo_design))
 async def skip_photo_design(callback_query: types.CallbackQuery, state: FSMContext):
+    """
+    Если пользователь не хочет добавлять фото, пропускаем шаг.
+    """
     await callback_query.answer()
     await state.update_data(design_photo=None)
     await callback_query.message.answer("Отправьте локацию:", reply_markup=location_keyboard)
@@ -239,6 +271,9 @@ async def skip_photo_design(callback_query: types.CallbackQuery, state: FSMConte
 
 @router.message(StateFilter(OrderForm.photo_design), F.content_type.in_({types.ContentType.PHOTO, types.ContentType.DOCUMENT}))
 async def handle_photo_design(message: types.Message, state: FSMContext):
+    """
+    Сохраняем фото, если оно есть, и переходим к локации.
+    """
     file_id = None
     if message.photo:
         file_id = message.photo[-1].file_id
@@ -250,6 +285,9 @@ async def handle_photo_design(message: types.Message, state: FSMContext):
 
 @router.message(StateFilter(OrderForm.location), F.content_type == types.ContentType.LOCATION)
 async def handle_location(message: types.Message, state: FSMContext):
+    """
+    Сохраняем локацию, просим комментарий к доставке.
+    """
     location = message.location
     await state.update_data(location=location)
     builder = InlineKeyboardBuilder()
@@ -261,17 +299,26 @@ async def handle_location(message: types.Message, state: FSMContext):
 
 @router.message(StateFilter(OrderForm.delivery_comment))
 async def handle_delivery_comment(message: types.Message, state: FSMContext):
+    """
+    Сохраняем комментарий к доставке и отправляем заказ администратору.
+    """
     delivery_comment = message.text.strip()
     await state.update_data(delivery_comment=delivery_comment)
     await send_order_to_admin(message.from_user.id, state)
 
 @router.callback_query(lambda c: c.data == 'skip_comment', StateFilter(OrderForm.delivery_comment))
 async def skip_delivery_comment(callback_query: types.CallbackQuery, state: FSMContext):
+    """
+    Если пользователь пропускает комментарий, сохраняем "Не указан".
+    """
     await callback_query.answer()
     await state.update_data(delivery_comment="Не указан")
     await send_order_to_admin(callback_query.from_user.id, state)
 
 async def send_order_to_admin(user_id, state: FSMContext):
+    """
+    Создаем запись в orders и отправляем информацию администратору и в группу.
+    """
     data = await state.get_data()
     product = data.get('product')
     quantity = data.get('quantity')
@@ -279,6 +326,7 @@ async def send_order_to_admin(user_id, state: FSMContext):
     design_photo = data.get('design_photo')
     location = data.get('location')
     delivery_comment = data.get('delivery_comment') or "Не указан"
+
     cursor.execute("SELECT name, contact, username FROM clients WHERE user_id=?", (user_id,))
     client = cursor.fetchone()
     if client:
@@ -289,7 +337,10 @@ async def send_order_to_admin(user_id, state: FSMContext):
         user_name = "Неизвестный"
         user_contact = "Не указан"
         user_username = "Не указан"
+
     order_time = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    # Сохраняем заказ в БД
     cursor.execute("""
         INSERT INTO orders (user_id, product, quantity, design_text, design_photo,
         location_lat, location_lon, order_time, delivery_comment, status)
@@ -299,6 +350,7 @@ async def send_order_to_admin(user_id, state: FSMContext):
         location.latitude, location.longitude, order_time, delivery_comment
     ))
     conn.commit()
+
     order_id = cursor.lastrowid
     order_message = (
         f"📣 <b>Новый заказ #{order_id}</b> 📣\n\n"
@@ -308,10 +360,13 @@ async def send_order_to_admin(user_id, state: FSMContext):
         f"📝 <b>Дизайн:</b> {design_text}\n"
         f"🗒️ <b>Комментарий:</b> {delivery_comment}"
     )
+
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Одобрить", callback_data=f"approve_{order_id}")
     builder.button(text="❌ Отклонить", callback_data=f"reject_{order_id}")
     markup = builder.as_markup()
+
+    # Отправляем сообщение администратору и в группу
     recipients = ADMIN_CHAT_IDS + [GROUP_CHAT_ID]
     for chat_id in recipients:
         try:
@@ -321,53 +376,77 @@ async def send_order_to_admin(user_id, state: FSMContext):
                 await bot.send_document(chat_id, design_photo)
         except Exception as e:
             logger.error(f"Error sending order to chat {chat_id}: {e}")
-    await bot.send_message(user_id, "Ваш заказ отправлен. Ожидайте подтверждения.", reply_markup=get_main_keyboard(user_id in ADMIN_CHAT_IDS, True))
+
+    await bot.send_message(
+        user_id,
+        "Ваш заказ отправлен. Ожидайте подтверждения.",
+        reply_markup=get_main_keyboard(user_id in ADMIN_CHAT_IDS, True)
+    )
     await state.clear()
 
 @router.callback_query(lambda c: c.data and c.data.startswith("approve_"))
 async def approve_order(callback_query: types.CallbackQuery, state: FSMContext):
+    """
+    Администратор одобряет заказ -> Запрашиваем цену в суммах.
+    """
     await callback_query.answer()
     order_id = int(callback_query.data.split('_')[1])
     admin_id = callback_query.from_user.id
     if admin_id not in ADMIN_CHAT_IDS:
         await callback_query.answer("У вас нет прав.", show_alert=True)
         return
+
     cursor.execute("UPDATE orders SET status='Ожидание цены' WHERE order_id=?", (order_id,))
     conn.commit()
+
     await state.update_data(order_id=order_id)
     await callback_query.message.answer(f"Введите цену за единицу для заказа #{order_id} (в суммах):")
     await state.set_state(AdminPriceState.waiting_for_price)
 
 @router.message(AdminPriceState.waiting_for_price)
 async def process_admin_price(message: types.Message, state: FSMContext):
+    """
+    Сохраняем введённую администратором цену (в суммах) -> admin_price.
+    """
     price_text = message.text.strip()
     if not price_text.isdigit():
         await message.reply("Цена должна быть числом.")
         return
+
     admin_price_sum = float(price_text)
     admin_price_tiyin = admin_price_sum * 100
+
     data = await state.get_data()
     order_id = data.get('order_id')
     if not order_id:
         await message.reply("Ошибка: заказ не найден.")
         await state.clear()
         return
+
+    # Сохраняем admin_price в БД
     cursor.execute("UPDATE orders SET admin_price=? WHERE order_id=?", (admin_price_sum, order_id))
     conn.commit()
+
+    # Извлекаем некоторые данные заказа для уведомления пользователя
     cursor.execute("SELECT user_id, product, quantity FROM orders WHERE order_id=?", (order_id,))
     result = cursor.fetchone()
     if not result:
         await message.reply("Ошибка: заказ не найден.")
         await state.clear()
         return
+
     client_id, product, quantity = result
-    total_amount_sum = admin_price_sum * quantity
+    total_amount_sum = admin_price_sum * quantity  # общая сумма в суммах
     inline_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Согласен", callback_data=f"client_accept_order_{order_id}")],
         [InlineKeyboardButton(text="❌ Отменить заказ", callback_data=f"client_cancel_order_{order_id}")]
     ])
-    await bot.send_message(client_id, 
-        f"Ваш заказ #{order_id} одобрен!\nЦена за единицу: {admin_price_sum} сум (преобразовано в {admin_price_tiyin} тийинов).\n"
+
+    # Сообщаем клиенту, что заказ одобрен с такой-то ценой
+    await bot.send_message(
+        client_id,
+        f"Ваш заказ #{order_id} одобрен!\n"
+        f"Цена за единицу: {admin_price_sum} сум (преобразовано в {admin_price_tiyin} тийинов).\n"
         f"Итоговая сумма: {total_amount_sum} сум.\nПодтверждаете заказ?",
         reply_markup=inline_kb
     )
@@ -376,49 +455,71 @@ async def process_admin_price(message: types.Message, state: FSMContext):
 
 @router.callback_query(lambda c: c.data and c.data.startswith("client_accept_order_"))
 async def client_accept_order(callback_query: types.CallbackQuery, state: FSMContext):
+    """
+    Клиент подтверждает заказ -> создаём инвойс через /click-api/create_invoice.
+    """
     await callback_query.answer()
     order_id = int(callback_query.data.split('_')[-1])
+
+    # Обновляем статус заказа
     cursor.execute("UPDATE orders SET status='Ожидание оплаты' WHERE order_id=?", (order_id,))
     conn.commit()
+
+    # Извлекаем admin_price, product, quantity, user_id
     cursor.execute("SELECT admin_price, product, quantity, user_id FROM orders WHERE order_id=?", (order_id,))
     result = cursor.fetchone()
     if not result:
         await callback_query.message.answer("Ошибка: заказ не найден.")
         return
+
     admin_price_sum, product, quantity, user_id = result
     unit_price_tiyin = admin_price_sum * 100
     total_amount_sum = admin_price_sum * quantity
-    import uuid
+
+    # Генерируем уникальный merchant_trans_id
     merchant_trans_id = str(uuid.uuid4())
     cursor.execute("UPDATE orders SET merchant_trans_id=? WHERE order_id=?", (merchant_trans_id, order_id))
     conn.commit()
+
+    # Получаем контакт клиента
     cursor.execute("SELECT contact FROM clients WHERE user_id=?", (user_id,))
     client_data = cursor.fetchone()
     client_phone = client_data[0] if client_data and client_data[0] else ""
+
     BASE_URL = f"{config.SELF_URL}/click-api"
     payload = {
         "merchant_trans_id": merchant_trans_id,
-        "amount": total_amount_sum,
+        "amount": total_amount_sum,  # Сумма в суммах
         "phone_number": client_phone
     }
+
     try:
         response = requests.post(f"{BASE_URL}/create_invoice", json=payload, timeout=30)
         invoice_response = response.json()
         print("Invoice response:", invoice_response)
+
         payment_url = invoice_response.get("payment_url")
+        # Если API вернул invoice_id, формируем ссылку вручную
         if not payment_url and invoice_response.get("invoice_id"):
             invoice_id = invoice_response["invoice_id"]
             payment_url = f"https://api.click.uz/pay/invoice/{invoice_id}"
+
         if not payment_url:
+            # Если нет ссылки, сообщаем об ошибке
             await callback_query.message.answer("Ошибка создания инвойса. Детали: " + json.dumps(invoice_response), parse_mode=None)
             return
+
+        # Сохраняем ссылку в БД
         cursor.execute("UPDATE orders SET payment_url=? WHERE order_id=?", (payment_url, order_id))
         conn.commit()
+
+        # Отправляем кнопку "Оплатить"
         inline_kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 Оплатить", url=payment_url)]
         ])
         await callback_query.message.edit_text(
-            f"Заказ #{order_id} подтвержден.\nЦена за единицу: {admin_price_sum} сум (преобразовано в {unit_price_tiyin} тийинов).\n"
+            f"Заказ #{order_id} подтвержден.\n"
+            f"Цена за единицу: {admin_price_sum} сум (преобразовано в {unit_price_tiyin} тийинов).\n"
             f"Итоговая сумма: {total_amount_sum} сум.\nНажмите кнопку ниже для оплаты.",
             reply_markup=inline_kb
         )
@@ -427,6 +528,9 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
 
 @router.callback_query(lambda c: c.data and c.data.startswith("client_cancel_order_"))
 async def client_cancel_order(callback_query: types.CallbackQuery, state: FSMContext):
+    """
+    Клиент отменяет заказ.
+    """
     await callback_query.answer()
     order_id = int(callback_query.data.split('_')[-1])
     cursor.execute("UPDATE orders SET status='Отменён клиентом' WHERE order_id=?", (order_id,))
@@ -435,19 +539,25 @@ async def client_cancel_order(callback_query: types.CallbackQuery, state: FSMCon
 
 @router.callback_query(lambda c: c.data and c.data.startswith("reject_"))
 async def reject_order(callback_query: types.CallbackQuery):
+    """
+    Администратор отклоняет заказ.
+    """
     await callback_query.answer()
     order_id = int(callback_query.data.split('_')[1])
     admin_id = callback_query.from_user.id
     if admin_id not in ADMIN_CHAT_IDS:
         await callback_query.answer("Нет прав.", show_alert=True)
         return
+
     cursor.execute("UPDATE orders SET status='Отклонено' WHERE order_id=?", (order_id,))
     conn.commit()
+
     cursor.execute("SELECT user_id FROM orders WHERE order_id=?", (order_id,))
     result = cursor.fetchone()
     if result:
         client_id = result[0]
         await bot.send_message(client_id, f"Ваш заказ #{order_id} отклонён.")
+
     await callback_query.answer("Заказ отклонён.", show_alert=True)
 
 async def main():

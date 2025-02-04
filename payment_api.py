@@ -11,6 +11,7 @@ if not os.path.exists(config_path):
     if config_content:
         with open(config_path, "w", encoding="utf-8") as f:
             f.write(config_content)
+        print("config.py создан из переменной окружения CONFIG_CONTENT")
     else:
         raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
 
@@ -26,6 +27,7 @@ import config  # Импорт настроек из config.py
 
 app = Flask(__name__)
 
+# Настройки из config.py
 MERCHANT_USER_ID = config.MERCHANT_USER_ID
 SECRET_KEY = config.SECRET_KEY
 SERVICE_ID = config.SERVICE_ID
@@ -60,32 +62,44 @@ CREATE TABLE IF NOT EXISTS orders (
 )
 """)
 conn.commit()
+app.logger.info("База данных и таблица orders инициализированы.")
 
 def generate_auth_header():
     timestamp = str(int(time.time()))
     digest = hashlib.sha1((timestamp + SECRET_KEY).encode('utf-8')).hexdigest()
-    return f"{MERCHANT_USER_ID}:{digest}:{timestamp}"
+    header = f"{MERCHANT_USER_ID}:{digest}:{timestamp}"
+    app.logger.info("Сгенерирован auth header: %s", header)
+    return header
 
 def notify_admins(message_text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": GROUP_CHAT_ID, "text": message_text, "parse_mode": "HTML"}
     try:
         requests.post(url, data=payload, timeout=10)
+        app.logger.info("Уведомление отправлено: %s", message_text)
     except Exception as e:
         app.logger.error("Ошибка отправки уведомления в Telegram: %s", e)
 
 @app.route("/click-api/create_invoice", methods=["POST"])
 def create_invoice():
-    # Получаем данные из JSON или form
+    app.logger.info("Получен запрос на создание инвойса: %s", request.data.decode())
     data = request.get_json() or request.form
+    app.logger.info("Данные запроса: %s", data)
 
     required_fields = ["merchant_trans_id", "amount", "phone_number"]
     for field in required_fields:
         if field not in data:
-            return jsonify({"error": "-8", "error_note": f"Missing field: {field}"}), 400
+            error_msg = f"Missing field: {field}"
+            app.logger.error(error_msg)
+            return jsonify({"error": "-8", "error_note": error_msg}), 400
 
     merchant_trans_id = data["merchant_trans_id"]
-    amount = float(data["amount"])
+    try:
+        amount = float(data["amount"])
+    except Exception as e:
+        error_msg = f"Ошибка преобразования amount: {e}"
+        app.logger.error(error_msg)
+        return jsonify({"error": "-8", "error_note": error_msg}), 400
     phone_number = data["phone_number"]
 
     headers = {
@@ -101,11 +115,13 @@ def create_invoice():
         "phone_number": phone_number,
         "merchant_trans_id": merchant_trans_id
     }
+    app.logger.info("Payload для создания инвойса: %s", json.dumps(payload, indent=2))
     try:
         resp = requests.post("https://api.click.uz/v2/merchant/invoice/create",
                              headers=headers,
                              json=payload,
                              timeout=30)
+        app.logger.info("HTTP-статус создания инвойса: %s", resp.status_code)
         if resp.status_code != 200:
             app.logger.error("Invoice creation failed: %s", resp.text)
             return jsonify({
@@ -114,20 +130,26 @@ def create_invoice():
                 "http_code": resp.status_code,
                 "response": resp.text
             }), 200
-        app.logger.info("Invoice created: %s", json.dumps(resp.json()))
-        return jsonify(resp.json()), 200
+        invoice_data = resp.json()
+        app.logger.info("Invoice created: %s", json.dumps(invoice_data, indent=2))
+        return jsonify(invoice_data), 200
     except Exception as e:
         app.logger.error("Invoice creation exception: %s", str(e))
         return jsonify({"error": "-9", "error_note": str(e)}), 200
 
 @app.route("/click-api/prepare", methods=["POST"])
 def prepare():
+    app.logger.info("Получен запрос на prepare: %s", request.data.decode())
     required_fields = ["click_trans_id", "merchant_trans_id", "amount"]
     for field in required_fields:
         if field not in request.form:
-            return jsonify({"error": "-8", "error_note": f"Missing field: {field}"}), 400
+            error_msg = f"Missing field: {field}"
+            app.logger.error(error_msg)
+            return jsonify({"error": "-8", "error_note": error_msg}), 400
+
     click_trans_id = request.form["click_trans_id"]
     merchant_trans_id = request.form["merchant_trans_id"]
+    app.logger.info("Prepare: click_trans_id=%s, merchant_trans_id=%s", click_trans_id, merchant_trans_id)
     cursor.execute("UPDATE orders SET status=?, cost_info=? WHERE merchant_trans_id=?",
                    ("pending", click_trans_id, merchant_trans_id))
     if cursor.rowcount == 0:
@@ -141,12 +163,12 @@ def prepare():
         "error": "0",
         "error_note": "Success"
     }
+    app.logger.info("Ответ prepare: %s", json.dumps(response, indent=2))
     return jsonify(response)
 
 @app.route("/click-api/complete", methods=["POST"])
 def complete():
-    # Обязательные поля – unit_price и quantity мы не требуем, а берем из запроса, если они есть,
-    # иначе из БД
+    app.logger.info("Получен запрос на complete: %s", request.data.decode())
     required_fields = ["click_trans_id", "merchant_trans_id", "merchant_prepare_id", "amount"]
     for field in required_fields:
         if field not in request.form:
@@ -164,7 +186,7 @@ def complete():
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Получаем unit_price: сначала пытаемся из запроса, иначе из базы (админ вводит цену в суммах)
+    # Получаем unit_price: пытаемся из запроса, иначе из БД
     unit_price_str = request.form.get("unit_price")
     if unit_price_str:
         try:
@@ -177,7 +199,6 @@ def complete():
         cursor.execute("SELECT admin_price FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
         row = cursor.fetchone()
         if row and row[0]:
-            # admin_price хранится в суммах; преобразуем в тийины (1 сум = 100 тийинов)
             unit_price = float(row[0]) * 100
             app.logger.info("unit_price взят из БД и преобразован: %s", unit_price)
         else:
@@ -185,7 +206,7 @@ def complete():
             app.logger.error(error_msg)
             return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Получаем quantity: сначала из запроса, если нет – из БД
+    # Получаем quantity: пытаемся из запроса, если нет – из БД
     quantity_str = request.form.get("quantity")
     if quantity_str:
         try:
@@ -213,8 +234,10 @@ def complete():
     else:
         product_name = "Неизвестный товар"
 
-    app.logger.info("Параметры /complete: click_trans_id=%s, merchant_trans_id=%s, amount=%s, product_name=%s, quantity=%s, unit_price=%s",
-                      click_trans_id, merchant_trans_id, amount, product_name, quantity, unit_price)
+    app.logger.info(
+        "Параметры /complete: click_trans_id=%s, merchant_trans_id=%s, amount=%s, product_name=%s, quantity=%s, unit_price=%s",
+        click_trans_id, merchant_trans_id, amount, product_name, quantity, unit_price
+    )
 
     cursor.execute("SELECT * FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
     order_row = cursor.fetchone()
