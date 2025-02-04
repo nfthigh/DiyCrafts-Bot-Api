@@ -104,7 +104,6 @@ def create_invoice():
                              json=payload,
                              timeout=30)
         if resp.status_code != 200:
-            # Логирование полного ответа
             app.logger.error(f"Invoice creation failed: {resp.text}")
             return jsonify({
                 "error": "-9",
@@ -127,11 +126,12 @@ def prepare():
     click_trans_id = request.form["click_trans_id"]
     merchant_trans_id = request.form["merchant_trans_id"]
     amount = float(request.form["amount"])
-    cursor.execute("UPDATE orders SET total=?, status=?, cost_info=? WHERE merchant_trans_id=?",
-                   (amount, "pending", click_trans_id, merchant_trans_id))
+    # Используем поле cost_info вместо несуществующего total
+    cursor.execute("UPDATE orders SET cost_info=?, status=? WHERE merchant_trans_id=?",
+                   (str(amount), "pending", merchant_trans_id))
     if cursor.rowcount == 0:
-        cursor.execute("INSERT INTO orders (merchant_trans_id, total, status, cost_info) VALUES (?, ?, ?, ?)",
-                       (merchant_trans_id, amount, "pending", click_trans_id))
+        cursor.execute("INSERT INTO orders (merchant_trans_id, cost_info, status) VALUES (?, ?, ?)",
+                       (merchant_trans_id, str(amount), "pending"))
     conn.commit()
     response = {
         "click_trans_id": click_trans_id,

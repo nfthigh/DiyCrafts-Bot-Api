@@ -341,8 +341,6 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     if not price_text.isdigit():
         await message.reply("Цена должна быть числом.")
         return
-    # Цена вводится в суммах; для инвойса передаем сумму как есть,
-    # а для фискализации цена переводится в тийины (1 сум = 100 тийинов)
     admin_price_sum = float(price_text)
     admin_price_tiyin = admin_price_sum * 100
     data = await state.get_data()
@@ -386,9 +384,8 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
         return
     admin_price_sum, product, quantity, user_id = result
     unit_price_tiyin = admin_price_sum * 100
-    total_amount = unit_price_tiyin * quantity
     total_amount_sum = admin_price_sum * quantity
-    import uuid
+    # Генерация стандартного UUID для merchant_trans_id:
     merchant_trans_id = str(uuid.uuid4())
     cursor.execute("UPDATE orders SET merchant_trans_id=? WHERE order_id=?", (merchant_trans_id, order_id))
     conn.commit()
@@ -398,13 +395,14 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     BASE_URL = f"{config.SELF_URL}/click-api"
     payload = {
         "merchant_trans_id": merchant_trans_id,
-        "amount": total_amount_sum,  # передаем сумму в суммах
+        "amount": total_amount_sum,  # сумма в суммах
         "phone_number": client_phone
     }
     try:
-        response = requests.post(f"{BASE_URL}/create_invoice", json=payload, timeout=30)
+        # Отправляем данные через form-data (data=payload)
+        response = requests.post(f"{BASE_URL}/create_invoice", data=payload, timeout=30)
         invoice_response = response.json()
-        print("Invoice response:", invoice_response)  # логируем полный ответ
+        print("Invoice response:", invoice_response)
         payment_url = invoice_response.get("payment_url")
         if not payment_url and invoice_response.get("invoice_id"):
             invoice_id = invoice_response["invoice_id"]
@@ -419,7 +417,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
         ])
         await callback_query.message.edit_text(
             f"Заказ #{order_id} подтвержден.\nЦена за единицу: {admin_price_sum} сум (преобразовано в {unit_price_tiyin} тийинов).\n"
-            f"Итоговая сумма: {total_amount_sum} сум ({total_amount} тийинов).\nНажмите кнопку ниже для оплаты.",
+            f"Итоговая сумма: {total_amount_sum} сум ({unit_price_tiyin * quantity} тийинов).\nНажмите кнопку ниже для оплаты.",
             reply_markup=inline_kb
         )
     except Exception as e:
