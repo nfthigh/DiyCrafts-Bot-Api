@@ -1,5 +1,19 @@
 # payment_api.py
 import os
+import os.path
+
+# Определяем абсолютный путь до config.py и создаем его из CONFIG_CONTENT, если он отсутствует
+basedir = os.path.dirname(os.path.abspath(__file__))
+config_path = os.path.join(basedir, "config.py")
+
+if not os.path.exists(config_path):
+    config_content = os.getenv("CONFIG_CONTENT")
+    if config_content:
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(config_content)
+    else:
+        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
+
 import time
 import hashlib
 import json
@@ -62,7 +76,6 @@ def notify_admins(message_text):
 
 @app.route("/click-api/create_invoice", methods=["POST"])
 def create_invoice():
-    # Получаем данные из JSON или form
     data = request.get_json() or request.form
 
     required_fields = ["merchant_trans_id", "amount", "phone_number"]
@@ -114,7 +127,6 @@ def prepare():
             return jsonify({"error": "-8", "error_note": f"Missing field: {field}"}), 400
     click_trans_id = request.form["click_trans_id"]
     merchant_trans_id = request.form["merchant_trans_id"]
-    # Обновляем запись без несуществующей колонки total
     cursor.execute("UPDATE orders SET status=?, cost_info=? WHERE merchant_trans_id=?",
                    ("pending", click_trans_id, merchant_trans_id))
     if cursor.rowcount == 0:
@@ -132,7 +144,6 @@ def prepare():
 
 @app.route("/click-api/complete", methods=["POST"])
 def complete():
-    # Требуем только основные поля, остальные берем из БД, если отсутствуют
     required_fields = ["click_trans_id", "merchant_trans_id", "merchant_prepare_id", "amount", "unit_price"]
     for field in required_fields:
         if field not in request.form:
@@ -156,7 +167,7 @@ def complete():
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Если quantity отсутствует в запросе, получаем его из заказа в БД
+    # Если quantity отсутствует, получаем его из БД
     quantity_str = request.form.get("quantity")
     if quantity_str:
         try:
@@ -176,7 +187,7 @@ def complete():
             app.logger.error(error_msg)
             return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Получаем название товара из заказа, если оно отсутствует в запросе
+    # Получаем название товара из заказа (из поля product)
     cursor.execute("SELECT product FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
     row = cursor.fetchone()
     if row and row[0]:
@@ -202,7 +213,6 @@ def complete():
     conn.commit()
 
     try:
-        # Формируем фискальный элемент с данными товара
         fiscal_item = create_fiscal_item(product_name, quantity, unit_price)
         fiscal_items = [fiscal_item]
         app.logger.info("Фискальные данные сформированы: %s", json.dumps(fiscal_items, indent=2, ensure_ascii=False))
