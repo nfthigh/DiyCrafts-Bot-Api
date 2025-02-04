@@ -19,7 +19,7 @@ import threading
 import sqlite3
 from flask import Flask, request, jsonify
 from fiscal import create_fiscal_item
-import config  # Импорт настроек из config.py
+import config  # Импорт настроек
 
 app = Flask(__name__)
 
@@ -73,14 +73,18 @@ def notify_admins(message_text):
 
 @app.route("/click-api/create_invoice", methods=["POST"])
 def create_invoice():
+    # Сначала пытаемся получить данные из JSON, иначе из form
+    data = request.get_json() or request.form
+
     required_fields = ["merchant_trans_id", "amount", "phone_number"]
     for field in required_fields:
-        if field not in request.form:
+        if field not in data:
             return jsonify({"error": "-8", "error_note": f"Missing field: {field}"}), 400
-    merchant_trans_id = request.form["merchant_trans_id"]
-    # Сумма передается как есть (в суммах)
-    amount = float(request.form["amount"])
-    phone_number = request.form["phone_number"]
+
+    merchant_trans_id = data["merchant_trans_id"]
+    amount = float(data["amount"])
+    phone_number = data["phone_number"]
+
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -95,20 +99,23 @@ def create_invoice():
         "merchant_trans_id": merchant_trans_id
     }
     try:
-        # Отправляем JSON-запрос
         resp = requests.post("https://api.click.uz/v2/merchant/invoice/create",
                              headers=headers,
                              json=payload,
                              timeout=30)
         if resp.status_code != 200:
+            # Логирование полного ответа
+            app.logger.error(f"Invoice creation failed: {resp.text}")
             return jsonify({
                 "error": "-9",
                 "error_note": "Invoice creation failed",
                 "http_code": resp.status_code,
                 "response": resp.text
             }), 200
+        app.logger.info("Invoice created: " + json.dumps(resp.json()))
         return jsonify(resp.json()), 200
     except Exception as e:
+        app.logger.error("Invoice creation exception: " + str(e))
         return jsonify({"error": "-9", "error_note": str(e)}), 200
 
 @app.route("/click-api/prepare", methods=["POST"])

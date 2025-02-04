@@ -29,7 +29,7 @@ if not os.path.exists("config.py"):
     else:
         raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
 
-import config  # Импортируем настройки
+import config  # Импорт настроек
 
 API_TOKEN = config.TELEGRAM_BOT_TOKEN
 ADMIN_CHAT_IDS = config.ADMIN_CHAT_IDS
@@ -168,7 +168,6 @@ async def handle_contact_prompt(message: types.Message):
 
 @router.message(StateFilter(OrderForm.name))
 async def register_name(message: types.Message, state: FSMContext):
-    # Добавляем проверку на наличие текста
     if not message.text:
         await message.reply("Пожалуйста, введите ваше имя.")
         return
