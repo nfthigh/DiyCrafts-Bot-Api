@@ -143,7 +143,8 @@ def prepare():
 
 @app.route("/click-api/complete", methods=["POST"])
 def complete():
-    required_fields = ["click_trans_id", "merchant_trans_id", "merchant_prepare_id", "amount", "product_name", "quantity", "unit_price"]
+    # Не требуем "product_name" из запроса, а потом получаем его из БД
+    required_fields = ["click_trans_id", "merchant_trans_id", "merchant_prepare_id", "amount", "quantity", "unit_price"]
     for field in required_fields:
         if field not in request.form:
             error_msg = f"Missing field: {field}"
@@ -159,7 +160,8 @@ def complete():
         error_msg = f"Ошибка преобразования amount: {e}"
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
-    product_name = request.form["product_name"]
+
+    # Теперь поле product_name не передаётся, поэтому получаем его из базы данных
     try:
         quantity = int(request.form["quantity"])
     except Exception as e:
@@ -172,6 +174,14 @@ def complete():
         error_msg = f"Ошибка преобразования unit_price: {e}"
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
+
+    # Получаем название товара из заказа (из поля product)
+    cursor.execute("SELECT product FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
+    row = cursor.fetchone()
+    if row and row[0]:
+        product_name = row[0]
+    else:
+        product_name = "Неизвестный товар"
 
     app.logger.info("Параметры /complete: click_trans_id=%s, merchant_trans_id=%s, amount=%s, product_name=%s, quantity=%s, unit_price=%s",
                       click_trans_id, merchant_trans_id, amount, product_name, quantity, unit_price)
