@@ -389,7 +389,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     total_amount = unit_price_tiyin * quantity
     total_amount_sum = admin_price_sum * quantity
     import uuid
-    merchant_trans_id = f"order_{order_id}_{uuid.uuid4().hex[:6]}"
+    merchant_trans_id = str(uuid.uuid4())
     cursor.execute("UPDATE orders SET merchant_trans_id=? WHERE order_id=?", (merchant_trans_id, order_id))
     conn.commit()
     cursor.execute("SELECT contact FROM clients WHERE user_id=?", (user_id,))
