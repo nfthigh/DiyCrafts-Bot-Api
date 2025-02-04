@@ -1,5 +1,13 @@
 # payment_api.py
 import os
+
+if not os.path.exists("config.py"):
+    config_content = os.getenv("CONFIG_CONTENT")
+    if config_content:
+        with open("config.py", "w") as f:
+            f.write(config_content)
+    else:
+        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
 import time
 import uuid
 import hashlib
