@@ -1,13 +1,5 @@
 # bot.py
 import os
-
-if not os.path.exists("config.py"):
-    config_content = os.getenv("CONFIG_CONTENT")
-    if config_content:
-        with open("config.py", "w") as f:
-            f.write(config_content)
-    else:
-        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
 import logging
 import asyncio
 import sqlite3
@@ -15,6 +7,7 @@ import uuid
 import requests
 import threading
 import time
+import json
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, types, F, Router
@@ -336,7 +329,7 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     if not price_text.isdigit():
         await message.reply("Цена должна быть числом.")
         return
-    # Цена вводится в суммах, преобразуем в тийины (1 сум = 100 тийинов)
+    # Цена вводится в суммах, преобразуем в тийины: 1 сум = 100 тийинов.
     admin_price_sum = float(price_text)
     admin_price_tiyin = admin_price_sum * 100
     data = await state.get_data()
@@ -377,8 +370,10 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
         await callback_query.message.answer("Ошибка: заказ не найден.")
         return
     admin_price_sum, product, quantity, user_id = result
+    # Преобразуем цену: сумма в суммах умножается на 100 для получения тийинов.
     unit_price_tiyin = admin_price_sum * 100
     total_amount = unit_price_tiyin * quantity
+    total_amount_sum = total_amount / 100  # для отображения в суммах
     import uuid
     merchant_trans_id = f"order_{order_id}_{uuid.uuid4().hex[:6]}"
     cursor.execute("UPDATE orders SET merchant_trans_id=? WHERE order_id=?", (merchant_trans_id, order_id))
@@ -389,15 +384,16 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     BASE_URL = f"{config.SELF_URL}/click-api"
     payload = {
         "merchant_trans_id": merchant_trans_id,
-        "amount": total_amount,
+        "amount": total_amount,  # сумма в тийинах
         "phone_number": client_phone
     }
     try:
         response = requests.post(f"{BASE_URL}/create_invoice", data=payload, timeout=30)
         invoice_response = response.json()
+        print("Invoice response:", invoice_response)  # Логируем полный ответ
         payment_url = invoice_response.get("payment_url")
         if not payment_url:
-            await callback_query.message.answer("Ошибка создания инвойса. Попробуйте позже.")
+            await callback_query.message.answer("Ошибка создания инвойса. Детали: " + json.dumps(invoice_response))
             return
         cursor.execute("UPDATE orders SET payment_url=? WHERE order_id=?", (payment_url, order_id))
         conn.commit()
@@ -405,7 +401,8 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
             [InlineKeyboardButton(text="💳 Оплатить", url=payment_url)]
         ])
         await callback_query.message.edit_text(
-            f"Заказ #{order_id} подтвержден.\nЦена за единицу: {admin_price_sum} сум (преобразовано в {unit_price_tiyin} тийинов).\nНажмите кнопку ниже для оплаты.",
+            f"Заказ #{order_id} подтвержден.\nЦена за единицу: {admin_price_sum} сум (преобразовано в {unit_price_tiyin} тийинов).\n"
+            f"Итоговая сумма: {total_amount} тийинов ({total_amount_sum} сум).\nНажмите кнопку ниже для оплаты.",
             reply_markup=inline_kb
         )
     except Exception as e:

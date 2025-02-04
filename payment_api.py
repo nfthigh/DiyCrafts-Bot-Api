@@ -1,13 +1,5 @@
 # payment_api.py
 import os
-
-if not os.path.exists("config.py"):
-    config_content = os.getenv("CONFIG_CONTENT")
-    if config_content:
-        with open("config.py", "w") as f:
-            f.write(config_content)
-    else:
-        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
 import time
 import uuid
 import hashlib
@@ -17,6 +9,16 @@ import threading
 import sqlite3
 from flask import Flask, request, jsonify
 from fiscal import create_fiscal_item
+
+# Если файл config.py отсутствует, создаём его из переменной окружения CONFIG_CONTENT:
+if not os.path.exists("config.py"):
+    config_content = os.getenv("CONFIG_CONTENT")
+    if config_content:
+        with open("config.py", "w") as f:
+            f.write(config_content)
+    else:
+        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
+
 import config  # Импорт настроек из config.py
 
 app = Flask(__name__)
@@ -30,11 +32,10 @@ TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
 GROUP_CHAT_ID = config.GROUP_CHAT_ID
 SELF_URL = config.SELF_URL
 
-# Подключаемся к SQLite базе данных (тот же файл, что и у бота)
+# Подключаемся к SQLite базе данных
 conn = sqlite3.connect('clients.db', check_same_thread=False)
 cursor = conn.cursor()
 
-# Создаем таблицу orders, если её нет
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS orders (
     order_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,13 +99,18 @@ def create_invoice():
         "merchant_trans_id": merchant_trans_id
     }
     try:
-        # Используем data=payload, чтобы отправить form data, как в вашем примере
+        # Отправляем данные как form data (data=payload)
         resp = requests.post("https://api.click.uz/v2/merchant/invoice/create",
                              headers=headers,
                              data=payload,
                              timeout=30)
         if resp.status_code != 200:
-            return jsonify({"error": "-9", "error_note": "Invoice creation failed", "http_code": resp.status_code, "response": resp.text}), 200
+            return jsonify({
+                "error": "-9",
+                "error_note": "Invoice creation failed",
+                "http_code": resp.status_code,
+                "response": resp.text
+            }), 200
         return jsonify(resp.json()), 200
     except Exception as e:
         return jsonify({"error": "-9", "error_note": str(e)}), 200
