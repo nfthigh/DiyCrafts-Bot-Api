@@ -10,17 +10,17 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
     stream=sys.stdout
 )
+logger = logging.getLogger("payment_api")
 
 # Определяем абсолютный путь до config.py и создаем его из CONFIG_CONTENT, если отсутствует
 basedir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(basedir, "config.py")
-
 if not os.path.exists(config_path):
     config_content = os.getenv("CONFIG_CONTENT")
     if config_content:
         with open(config_path, "w", encoding="utf-8") as f:
             f.write(config_content)
-        logging.info("config.py создан из переменной окружения CONFIG_CONTENT")
+        logger.info("config.py создан из переменной окружения CONFIG_CONTENT")
     else:
         raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
 
@@ -31,11 +31,11 @@ import requests
 import threading
 import sqlite3
 from flask import Flask, request, jsonify
-from fiscal import create_fiscal_item
+from fiscal import create_fiscal_item  # Функция для формирования фискальных данных
 import config  # Импорт настроек из config.py
 
 app = Flask(__name__)
-app.logger = logging.getLogger("payment_api")
+app.logger = logger
 
 # Настройки из config.py
 MERCHANT_USER_ID = config.MERCHANT_USER_ID
@@ -121,7 +121,7 @@ def create_invoice():
     }
     payload = {
         "service_id": SERVICE_ID,
-        "amount": amount,
+        "amount": amount,   # Сумма платежа остаётся в суммах, без преобразования
         "phone_number": phone_number,
         "merchant_trans_id": merchant_trans_id
     }
@@ -165,6 +165,9 @@ def prepare():
     if cursor.rowcount == 0:
         cursor.execute("INSERT INTO orders (merchant_trans_id, status, cost_info) VALUES (?, ?, ?)",
                        (merchant_trans_id, "pending", click_trans_id))
+        app.logger.info("Новый заказ создан в режиме prepare.")
+    else:
+        app.logger.info("Заказ обновлён в режиме prepare.")
     conn.commit()
     response = {
         "click_trans_id": click_trans_id,
@@ -179,7 +182,6 @@ def prepare():
 @app.route("/click-api/complete", methods=["POST"])
 def complete():
     app.logger.info("Получен запрос на complete: %s", request.data.decode())
-    # Обязательные поля (unit_price и quantity не передаются в запросе, будем брать их из БД)
     required_fields = ["click_trans_id", "merchant_trans_id", "merchant_prepare_id", "amount"]
     for field in required_fields:
         if field not in request.form:
@@ -190,7 +192,6 @@ def complete():
     click_trans_id = request.form["click_trans_id"]
     merchant_trans_id = request.form["merchant_trans_id"]
     merchant_prepare_id = request.form["merchant_prepare_id"]
-
     try:
         amount = float(request.form["amount"])
     except Exception as e:
@@ -198,19 +199,19 @@ def complete():
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Получаем unit_price исключительно из БД (администратор вводит цену, которая сохраняется в admin_price)
+    # Получаем unit_price исключительно из БД (администратор вводит цену в суммах, и мы преобразуем её в тийины)
     cursor.execute("SELECT admin_price FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
     row = cursor.fetchone()
     if row and row[0]:
-        # admin_price хранится в суммах; преобразуем в тийины (1 сум = 100 тийинов)
-        unit_price = float(row[0]) * 100
-        app.logger.info("unit_price взят из БД и преобразован: %s", unit_price)
+        admin_price = float(row[0])
+        unit_price = admin_price * 100  # переводим в тийины
+        app.logger.info("unit_price взят из БД: admin_price=%s, unit_price (тийины)=%s", admin_price, unit_price)
     else:
         error_msg = "Missing field: unit_price and не удалось извлечь из БД"
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Получаем quantity: если не передано в запросе, берем из БД
+    # Получаем quantity: если отсутствует в запросе, берем из БД
     quantity_str = request.form.get("quantity")
     if quantity_str:
         try:
@@ -230,7 +231,7 @@ def complete():
             app.logger.error(error_msg)
             return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Получаем название товара (из поля product)
+    # Получаем название товара из заказа (из поля product)
     cursor.execute("SELECT product FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
     row = cursor.fetchone()
     if row and row[0]:
@@ -277,7 +278,7 @@ def complete():
         "service_id": SERVICE_ID,
         "payment_id": click_trans_id,
         "items": fiscal_items,
-        "received_ecash": amount,
+        "received_ecash": amount,  # сумма платежа остается в суммах (без умножения)
         "received_cash": 0,
         "received_card": 0
     }
