@@ -1,16 +1,5 @@
 # payment_api.py
 import os
-# Определяем абсолютный путь до каталога текущего файла
-basedir = os.path.dirname(os.path.abspath(__file__))
-config_path = os.path.join(basedir, "config.py")
-
-if not os.path.exists(config_path):
-    config_content = os.getenv("CONFIG_CONTENT")
-    if config_content:
-        with open(config_path, "w") as f:
-            f.write(config_content)
-    else:
-        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
 import time
 import hashlib
 import json
@@ -73,7 +62,7 @@ def notify_admins(message_text):
 
 @app.route("/click-api/create_invoice", methods=["POST"])
 def create_invoice():
-    # Сначала пытаемся получить данные из JSON, иначе из form
+    # Получаем данные из JSON или form
     data = request.get_json() or request.form
 
     required_fields = ["merchant_trans_id", "amount", "phone_number"]
@@ -125,7 +114,7 @@ def prepare():
             return jsonify({"error": "-8", "error_note": f"Missing field: {field}"}), 400
     click_trans_id = request.form["click_trans_id"]
     merchant_trans_id = request.form["merchant_trans_id"]
-    # Обновляем запись без использования несуществующей колонки total
+    # Обновляем запись без несуществующей колонки total
     cursor.execute("UPDATE orders SET status=?, cost_info=? WHERE merchant_trans_id=?",
                    ("pending", click_trans_id, merchant_trans_id))
     if cursor.rowcount == 0:
@@ -143,8 +132,8 @@ def prepare():
 
 @app.route("/click-api/complete", methods=["POST"])
 def complete():
-    # Не требуем "product_name" из запроса, а потом получаем его из БД
-    required_fields = ["click_trans_id", "merchant_trans_id", "merchant_prepare_id", "amount", "quantity", "unit_price"]
+    # Требуем только основные поля, остальные берем из БД, если отсутствуют
+    required_fields = ["click_trans_id", "merchant_trans_id", "merchant_prepare_id", "amount", "unit_price"]
     for field in required_fields:
         if field not in request.form:
             error_msg = f"Missing field: {field}"
@@ -160,14 +149,6 @@ def complete():
         error_msg = f"Ошибка преобразования amount: {e}"
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
-
-    # Теперь поле product_name не передаётся, поэтому получаем его из базы данных
-    try:
-        quantity = int(request.form["quantity"])
-    except Exception as e:
-        error_msg = f"Ошибка преобразования quantity: {e}"
-        app.logger.error(error_msg)
-        return jsonify({"error": "-8", "error_note": error_msg}), 400
     try:
         unit_price = float(request.form["unit_price"])
     except Exception as e:
@@ -175,7 +156,27 @@ def complete():
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Получаем название товара из заказа (из поля product)
+    # Если quantity отсутствует в запросе, получаем его из заказа в БД
+    quantity_str = request.form.get("quantity")
+    if quantity_str:
+        try:
+            quantity = int(quantity_str)
+        except Exception as e:
+            error_msg = f"Ошибка преобразования quantity: {e}"
+            app.logger.error(error_msg)
+            return jsonify({"error": "-8", "error_note": error_msg}), 400
+    else:
+        cursor.execute("SELECT quantity FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
+        row = cursor.fetchone()
+        if row and row[0]:
+            quantity = row[0]
+            app.logger.info("Количество взято из БД: %s", quantity)
+        else:
+            error_msg = "Missing field: quantity and не удалось извлечь из БД"
+            app.logger.error(error_msg)
+            return jsonify({"error": "-8", "error_note": error_msg}), 400
+
+    # Получаем название товара из заказа, если оно отсутствует в запросе
     cursor.execute("SELECT product FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
     row = cursor.fetchone()
     if row and row[0]:
@@ -201,6 +202,7 @@ def complete():
     conn.commit()
 
     try:
+        # Формируем фискальный элемент с данными товара
         fiscal_item = create_fiscal_item(product_name, quantity, unit_price)
         fiscal_items = [fiscal_item]
         app.logger.info("Фискальные данные сформированы: %s", json.dumps(fiscal_items, indent=2, ensure_ascii=False))
@@ -224,6 +226,7 @@ def complete():
         "received_cash": 0,
         "received_card": 0
     }
+    app.logger.info("Фискальный payload: %s", json.dumps(fiscal_payload, indent=2, ensure_ascii=False))
     try:
         resp_fiscal = requests.post("https://api.click.uz/v2/merchant/payment/ofd_data/submit_items",
                                       headers=fiscal_headers,
@@ -239,7 +242,6 @@ def complete():
         fiscal_result = {"error_code": -1, "error_note": str(e)}
         app.logger.error("Исключение при фискализации: %s", e)
 
-    # Обновляем статус заказа на "completed"
     cursor.execute("UPDATE orders SET status='completed' WHERE merchant_trans_id=?", (merchant_trans_id,))
     conn.commit()
 
@@ -266,8 +268,7 @@ def auto_ping():
             requests.get(SELF_URL, timeout=10)
         except Exception as e:
             app.logger.error("Auto-ping error: %s", e)
-        # Пауза 4 минуты (240 секунд)
-        time.sleep(240)
+        time.sleep(240)  # 4 минуты
 
 # Запускаем автопинг в отдельном потоке
 ping_thread = threading.Thread(target=auto_ping, daemon=True)
