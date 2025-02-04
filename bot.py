@@ -411,7 +411,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
             invoice_id = invoice_response["invoice_id"]
             payment_url = f"https://api.click.uz/pay/invoice/{invoice_id}"
         if not payment_url:
-            await callback_query.message.answer("Ошибка создания инвойса. Детали: " + json.dumps(invoice_response))
+           await callback_query.message.answer("Ошибка создания инвойса. Детали: " + json.dumps(invoice_response), parse_mode=None)
             return
         cursor.execute("UPDATE orders SET payment_url=? WHERE order_id=?", (payment_url, order_id))
         conn.commit()
