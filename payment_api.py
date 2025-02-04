@@ -1,39 +1,34 @@
-# payment_api.py
+# main.py
 import os
-if not os.path.exists("config.py"):
-    config_content = os.getenv("CONFIG_CONTENT")
-    if config_content:
-        with open("config.py", "w") as f:
-            f.write(config_content)
-    else:
-        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
-import time
-import uuid
-import hashlib
-import json
-import requests
 import threading
+import time
+import asyncio
 import sqlite3
+import logging
 from flask import Flask, request, jsonify
-from fiscal import create_fiscal_item
-import config  # Импортируем настройки из config.py
+import requests
+import config  # Ваш конфигурационный файл
 
+# Импортируем необходимые модули для Flask-сервера
+from fiscal import create_fiscal_item
+
+# Настройка Flask-приложения
 app = Flask(__name__)
 
-# Используем настройки из config.py
+# Настройки из config.py
 MERCHANT_USER_ID = config.MERCHANT_USER_ID
 SECRET_KEY = config.SECRET_KEY
 SERVICE_ID = config.SERVICE_ID
-PHONE_NUMBER = config.PHONE_NUMBER  # не используется, номер берется из данных клиента
+PHONE_NUMBER = config.PHONE_NUMBER
 TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
 GROUP_CHAT_ID = config.GROUP_CHAT_ID
 SELF_URL = config.SELF_URL
 
-# Подключаемся к SQLite базе данных (используем ту же базу, что и бот)
+# Подключение к базе данных (один и тот же файл для веб-сервиса и бота)
 conn = sqlite3.connect('clients.db', check_same_thread=False)
 cursor = conn.cursor()
 
-# Создаем таблицу orders, если её нет
+# Создаем таблицы (если их еще нет)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS orders (
     order_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,13 +46,13 @@ CREATE TABLE IF NOT EXISTS orders (
     delivery_comment TEXT,
     admin_price REAL,
     payment_url TEXT,
-    is_paid INTEGER DEFAULT 0,
-    FOREIGN KEY (user_id) REFERENCES clients (user_id)
+    is_paid INTEGER DEFAULT 0
 )
 """)
 conn.commit()
 
 def generate_auth_header():
+    import time, hashlib
     timestamp = str(int(time.time()))
     digest = hashlib.sha1((timestamp + SECRET_KEY).encode('utf-8')).hexdigest()
     return f"{MERCHANT_USER_ID}:{digest}:{timestamp}"
@@ -70,9 +65,7 @@ def notify_admins(message_text):
         "parse_mode": "HTML"
     }
     try:
-        response = requests.post(url, data=payload, timeout=10)
-        if response.status_code != 200:
-            print("Ошибка уведомления:", response.text)
+        requests.post(url, data=payload, timeout=10)
     except Exception as e:
         print("Ошибка отправки уведомления в Telegram:", e)
 
@@ -85,7 +78,6 @@ def create_invoice():
     merchant_trans_id = request.form["merchant_trans_id"]
     amount = float(request.form["amount"])
     phone_number = request.form["phone_number"]
-
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -145,23 +137,19 @@ def complete():
     product_name = request.form["product_name"]
     quantity = int(request.form["quantity"])
     unit_price = float(request.form["unit_price"])
-
     cursor.execute("SELECT * FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
     order_row = cursor.fetchone()
     if not order_row:
         return jsonify({"error": "-5", "error_note": "Order not found"}), 404
     if order_row[-1] == 1:
         return jsonify({"error": "-4", "error_note": "Already paid"}), 400
-
     cursor.execute("UPDATE orders SET is_paid=1, status='processing' WHERE merchant_trans_id=?", (merchant_trans_id,))
     conn.commit()
-
     try:
         fiscal_item = create_fiscal_item(product_name, quantity, unit_price)
         fiscal_items = [fiscal_item]
     except Exception as e:
         return jsonify({"error": "-10", "error_note": str(e)}), 400
-
     fiscal_headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -186,7 +174,6 @@ def complete():
             fiscal_result = {"error_code": -1, "raw": resp_fiscal.text}
     except Exception as e:
         fiscal_result = {"error_code": -1, "error_note": str(e)}
-
     notification_message = (
         "💰 <b>Оплата прошла успешно!</b> 💰\n\n"
         f"✅ Заказ <b>{merchant_trans_id}</b> оплачен.\n"
@@ -198,7 +185,6 @@ def complete():
         f"<pre>{json.dumps(fiscal_items, indent=2, ensure_ascii=False)}</pre>"
     )
     notify_admins(notification_message)
-
     response = {
         "click_trans_id": click_trans_id,
         "merchant_trans_id": merchant_trans_id,

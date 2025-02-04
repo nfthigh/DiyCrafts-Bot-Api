@@ -1,12 +1,5 @@
 # bot.py
 import os
-if not os.path.exists("config.py"):
-    config_content = os.getenv("CONFIG_CONTENT")
-    if config_content:
-        with open("config.py", "w") as f:
-            f.write(config_content)
-    else:
-        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
 import logging
 import asyncio
 import sqlite3
@@ -26,7 +19,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
-import config  # Импорт настроек из config.py
+import config  # Импортируем настройки из config.py
 
 API_TOKEN = config.TELEGRAM_BOT_TOKEN
 ADMIN_CHAT_IDS = config.ADMIN_CHAT_IDS
@@ -49,11 +42,10 @@ dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-# Подключаемся к базе данных (один и тот же файл, чтобы использовать таблицы клиентов и заказов)
+# Подключаемся к базе данных (используем тот же файл, что и для payment_api)
 conn = sqlite3.connect('clients.db', check_same_thread=False)
 cursor = conn.cursor()
 
-# Создаем таблицы, если их не существует
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS clients (
     user_id INTEGER PRIMARY KEY,
@@ -336,9 +328,8 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     if not price_text.isdigit():
         await message.reply("Цена должна быть числом.")
         return
-    # Админ вводит цену в суммах, а нам нужно преобразовать в тийины:
+    # Админ вводит цену в суммах; преобразуем в тийины: 1 сум = 100 тийинов.
     admin_price_sum = float(price_text)
-    # Преобразуем: 1 сум = 100 тийинов
     admin_price_tiyin = admin_price_sum * 100
     data = await state.get_data()
     order_id = data.get('order_id')
@@ -378,7 +369,6 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
         await callback_query.message.answer("Ошибка: заказ не найден.")
         return
     admin_price_sum, product, quantity, user_id = result
-    # Преобразуем цену: введенная сумма (в суммах) умножается на 100 для получения тийинов
     unit_price_tiyin = admin_price_sum * 100
     total_amount = unit_price_tiyin * quantity
     import uuid
