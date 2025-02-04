@@ -15,7 +15,6 @@ import uuid
 import hashlib
 import json
 import requests
-import threading
 import sqlite3
 from flask import Flask, request, jsonify
 from fiscal import create_fiscal_item
@@ -126,12 +125,12 @@ def prepare():
     click_trans_id = request.form["click_trans_id"]
     merchant_trans_id = request.form["merchant_trans_id"]
     amount = float(request.form["amount"])
-    # Используем поле cost_info вместо несуществующего total
-    cursor.execute("UPDATE orders SET cost_info=?, status=? WHERE merchant_trans_id=?",
-                   (str(amount), "pending", merchant_trans_id))
+    # Обновляем запись без использования несуществующей колонки total
+    cursor.execute("UPDATE orders SET status=?, cost_info=? WHERE merchant_trans_id=?",
+                   ("pending", click_trans_id, merchant_trans_id))
     if cursor.rowcount == 0:
-        cursor.execute("INSERT INTO orders (merchant_trans_id, cost_info, status) VALUES (?, ?, ?)",
-                       (merchant_trans_id, str(amount), "pending"))
+        cursor.execute("INSERT INTO orders (merchant_trans_id, status, cost_info) VALUES (?, ?, ?)",
+                       (merchant_trans_id, "pending", click_trans_id))
     conn.commit()
     response = {
         "click_trans_id": click_trans_id,
@@ -216,22 +215,5 @@ def complete():
     }
     return jsonify(response)
 
-def autopinger():
-    while True:
-        time.sleep(300)
-        if SELF_URL:
-            try:
-                print("[AUTO-PING] Пингуем:", SELF_URL)
-                requests.get(SELF_URL, timeout=10)
-            except Exception as e:
-                print("[AUTO-PING] Ping error:", e)
-        else:
-            print("[AUTO-PING] SELF_URL not set. Waiting...")
-
-def run_autopinger_thread():
-    thread = threading.Thread(target=autopinger, daemon=True)
-    thread.start()
-
 if __name__ == "__main__":
-    run_autopinger_thread()
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)

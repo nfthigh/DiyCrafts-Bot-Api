@@ -341,6 +341,8 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     if not price_text.isdigit():
         await message.reply("Цена должна быть числом.")
         return
+    # Цена вводится в суммах; для инвойса передаем сумму как есть,
+    # а для фискализации цена переводится в тийины (1 сум = 100 тийинов)
     admin_price_sum = float(price_text)
     admin_price_tiyin = admin_price_sum * 100
     data = await state.get_data()
@@ -365,7 +367,7 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     ])
     await bot.send_message(client_id, 
         f"Ваш заказ #{order_id} одобрен!\nЦена за единицу: {admin_price_sum} сум (преобразовано в {admin_price_tiyin} тийинов).\n"
-        f"Итоговая сумма: {total_amount_sum} сум (для инвойса: {total_amount_sum} сум).\nПодтверждаете заказ?",
+        f"Итоговая сумма: {total_amount_sum} сум.\nПодтверждаете заказ?",
         reply_markup=inline_kb
     )
     await message.reply("Цена отправлена клиенту на подтверждение.")
@@ -384,8 +386,10 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
         return
     admin_price_sum, product, quantity, user_id = result
     unit_price_tiyin = admin_price_sum * 100
+    total_amount = unit_price_tiyin * quantity
     total_amount_sum = admin_price_sum * quantity
-    # Генерация стандартного UUID для merchant_trans_id:
+    import uuid
+    # Генерируем merchant_trans_id как простой UUID
     merchant_trans_id = str(uuid.uuid4())
     cursor.execute("UPDATE orders SET merchant_trans_id=? WHERE order_id=?", (merchant_trans_id, order_id))
     conn.commit()
@@ -395,14 +399,13 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     BASE_URL = f"{config.SELF_URL}/click-api"
     payload = {
         "merchant_trans_id": merchant_trans_id,
-        "amount": total_amount_sum,  # сумма в суммах
+        "amount": total_amount_sum,  # передаем сумму в суммах
         "phone_number": client_phone
     }
     try:
-        # Отправляем данные через form-data (data=payload)
-        response = requests.post(f"{BASE_URL}/create_invoice", data=payload, timeout=30)
+        response = requests.post(f"{BASE_URL}/create_invoice", json=payload, timeout=30)
         invoice_response = response.json()
-        print("Invoice response:", invoice_response)
+        print("Invoice response:", invoice_response)  # логирование полного ответа
         payment_url = invoice_response.get("payment_url")
         if not payment_url and invoice_response.get("invoice_id"):
             invoice_id = invoice_response["invoice_id"]
@@ -417,7 +420,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
         ])
         await callback_query.message.edit_text(
             f"Заказ #{order_id} подтвержден.\nЦена за единицу: {admin_price_sum} сум (преобразовано в {unit_price_tiyin} тийинов).\n"
-            f"Итоговая сумма: {total_amount_sum} сум ({unit_price_tiyin * quantity} тийинов).\nНажмите кнопку ниже для оплаты.",
+            f"Итоговая сумма: {total_amount_sum} сум ({total_amount} тийинов).\nНажмите кнопку ниже для оплаты.",
             reply_markup=inline_kb
         )
     except Exception as e:
@@ -448,24 +451,7 @@ async def reject_order(callback_query: types.CallbackQuery):
         await bot.send_message(client_id, f"Ваш заказ #{order_id} отклонён.")
     await callback_query.answer("Заказ отклонён.", show_alert=True)
 
-def bot_autopinger():
-    while True:
-        time.sleep(300)
-        if SELF_URL:
-            try:
-                print("[BOT AUTO-PING] Пингуем:", SELF_URL)
-                requests.get(SELF_URL, timeout=10)
-            except Exception as e:
-                print("[BOT AUTO-PING] Ошибка пинга:", e)
-        else:
-            print("[BOT AUTO-PING] SELF_URL не установлен. Ожидание...")
-
-def run_bot_autopinger():
-    thread = threading.Thread(target=bot_autopinger, daemon=True)
-    thread.start()
-
 async def main():
-    run_bot_autopinger()
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
