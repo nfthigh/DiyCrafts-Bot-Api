@@ -5,8 +5,6 @@ import asyncio
 import sqlite3
 import uuid
 import requests
-import threading
-import time
 import json
 from datetime import datetime
 
@@ -386,10 +384,9 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
         return
     admin_price_sum, product, quantity, user_id = result
     unit_price_tiyin = admin_price_sum * 100
-    total_amount = unit_price_tiyin * quantity
     total_amount_sum = admin_price_sum * quantity
     import uuid
-    # Генерируем merchant_trans_id как простой UUID
+    # Генерация merchant_trans_id как UUID
     merchant_trans_id = str(uuid.uuid4())
     cursor.execute("UPDATE orders SET merchant_trans_id=? WHERE order_id=?", (merchant_trans_id, order_id))
     conn.commit()
@@ -420,7 +417,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
         ])
         await callback_query.message.edit_text(
             f"Заказ #{order_id} подтвержден.\nЦена за единицу: {admin_price_sum} сум (преобразовано в {unit_price_tiyin} тийинов).\n"
-            f"Итоговая сумма: {total_amount_sum} сум ({total_amount} тийинов).\nНажмите кнопку ниже для оплаты.",
+            f"Итоговая сумма: {total_amount_sum} сум.\nНажмите кнопку ниже для оплаты.",
             reply_markup=inline_kb
         )
     except Exception as e:

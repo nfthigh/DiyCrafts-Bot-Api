@@ -11,7 +11,6 @@ if not os.path.exists("config.py"):
         raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
 
 import time
-import uuid
 import hashlib
 import json
 import requests
@@ -72,7 +71,7 @@ def notify_admins(message_text):
 
 @app.route("/click-api/create_invoice", methods=["POST"])
 def create_invoice():
-    # Сначала пытаемся получить данные из JSON, иначе из form
+    # Получаем данные из JSON, иначе из form
     data = request.get_json() or request.form
 
     required_fields = ["merchant_trans_id", "amount", "phone_number"]
