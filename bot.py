@@ -29,7 +29,7 @@ if not os.path.exists("config.py"):
     else:
         raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
 
-import config  # Импорт настроек
+import config  # Импортируем настройки
 
 API_TOKEN = config.TELEGRAM_BOT_TOKEN
 ADMIN_CHAT_IDS = config.ADMIN_CHAT_IDS
@@ -168,6 +168,10 @@ async def handle_contact_prompt(message: types.Message):
 
 @router.message(StateFilter(OrderForm.name))
 async def register_name(message: types.Message, state: FSMContext):
+    # Добавляем проверку на наличие текста
+    if not message.text:
+        await message.reply("Пожалуйста, введите ваше имя.")
+        return
     user_name = message.text.strip()
     if not user_name:
         await message.reply("Имя не может быть пустым.")
@@ -338,7 +342,7 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     if not price_text.isdigit():
         await message.reply("Цена должна быть числом.")
         return
-    # Цена вводится в суммах; для создания инвойса передаем сумму как есть,
+    # Цена вводится в суммах; для инвойса передаем сумму как есть,
     # а для фискализации цена переводится в тийины (1 сум = 100 тийинов)
     admin_price_sum = float(price_text)
     admin_price_tiyin = admin_price_sum * 100
@@ -357,7 +361,7 @@ async def process_admin_price(message: types.Message, state: FSMContext):
         await state.clear()
         return
     client_id, product, quantity = result
-    total_amount_sum = admin_price_sum * quantity  # итоговая сумма в суммах
+    total_amount_sum = admin_price_sum * quantity  # итоговая сумма в суммах для инвойса
     inline_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Согласен", callback_data=f"client_accept_order_{order_id}")],
         [InlineKeyboardButton(text="❌ Отменить заказ", callback_data=f"client_cancel_order_{order_id}")]
@@ -401,7 +405,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     try:
         response = requests.post(f"{BASE_URL}/create_invoice", json=payload, timeout=30)
         invoice_response = response.json()
-        print("Invoice response:", invoice_response)  # логирование полного ответа
+        print("Invoice response:", invoice_response)  # логируем полный ответ
         payment_url = invoice_response.get("payment_url")
         if not payment_url and invoice_response.get("invoice_id"):
             invoice_id = invoice_response["invoice_id"]
