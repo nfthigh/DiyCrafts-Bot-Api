@@ -1,6 +1,15 @@
 # payment_api.py
 import os
 import os.path
+import sys
+import logging
+
+# Настроим логирование в консоль (stdout)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    stream=sys.stdout
+)
 
 # Определяем абсолютный путь до config.py и создаем его из CONFIG_CONTENT, если отсутствует
 basedir = os.path.dirname(os.path.abspath(__file__))
@@ -11,7 +20,7 @@ if not os.path.exists(config_path):
     if config_content:
         with open(config_path, "w", encoding="utf-8") as f:
             f.write(config_content)
-        print("config.py создан из переменной окружения CONFIG_CONTENT")
+        logging.info("config.py создан из переменной окружения CONFIG_CONTENT")
     else:
         raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
 
@@ -26,6 +35,7 @@ from fiscal import create_fiscal_item
 import config  # Импорт настроек из config.py
 
 app = Flask(__name__)
+app.logger = logging.getLogger("payment_api")
 
 # Настройки из config.py
 MERCHANT_USER_ID = config.MERCHANT_USER_ID
@@ -169,6 +179,7 @@ def prepare():
 @app.route("/click-api/complete", methods=["POST"])
 def complete():
     app.logger.info("Получен запрос на complete: %s", request.data.decode())
+    # Обязательные поля (unit_price и quantity не передаются в запросе, будем брать их из БД)
     required_fields = ["click_trans_id", "merchant_trans_id", "merchant_prepare_id", "amount"]
     for field in required_fields:
         if field not in request.form:
@@ -179,6 +190,7 @@ def complete():
     click_trans_id = request.form["click_trans_id"]
     merchant_trans_id = request.form["merchant_trans_id"]
     merchant_prepare_id = request.form["merchant_prepare_id"]
+
     try:
         amount = float(request.form["amount"])
     except Exception as e:
@@ -186,27 +198,19 @@ def complete():
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Получаем unit_price: пытаемся из запроса, иначе из БД
-    unit_price_str = request.form.get("unit_price")
-    if unit_price_str:
-        try:
-            unit_price = float(unit_price_str)
-        except Exception as e:
-            error_msg = f"Ошибка преобразования unit_price: {e}"
-            app.logger.error(error_msg)
-            return jsonify({"error": "-8", "error_note": error_msg}), 400
+    # Получаем unit_price исключительно из БД (администратор вводит цену, которая сохраняется в admin_price)
+    cursor.execute("SELECT admin_price FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
+    row = cursor.fetchone()
+    if row and row[0]:
+        # admin_price хранится в суммах; преобразуем в тийины (1 сум = 100 тийинов)
+        unit_price = float(row[0]) * 100
+        app.logger.info("unit_price взят из БД и преобразован: %s", unit_price)
     else:
-        cursor.execute("SELECT admin_price FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
-        row = cursor.fetchone()
-        if row and row[0]:
-            unit_price = float(row[0]) * 100
-            app.logger.info("unit_price взят из БД и преобразован: %s", unit_price)
-        else:
-            error_msg = "Missing field: unit_price and не удалось извлечь из БД"
-            app.logger.error(error_msg)
-            return jsonify({"error": "-8", "error_note": error_msg}), 400
+        error_msg = "Missing field: unit_price and не удалось извлечь из БД"
+        app.logger.error(error_msg)
+        return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Получаем quantity: пытаемся из запроса, если нет – из БД
+    # Получаем quantity: если не передано в запросе, берем из БД
     quantity_str = request.form.get("quantity")
     if quantity_str:
         try:
@@ -226,7 +230,7 @@ def complete():
             app.logger.error(error_msg)
             return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Получаем название товара из заказа (из поля product)
+    # Получаем название товара (из поля product)
     cursor.execute("SELECT product FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
     row = cursor.fetchone()
     if row and row[0]:
