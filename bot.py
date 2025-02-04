@@ -27,7 +27,8 @@ SELF_URL = config.SELF_URL
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=API_TOKEN, parse_mode='HTML')
+# Создаем объект бота, передавая параметры по умолчанию в виде словаря
+bot = Bot(token=API_TOKEN, default={"parse_mode": "HTML"})
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
