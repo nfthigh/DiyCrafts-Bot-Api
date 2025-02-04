@@ -19,7 +19,7 @@ import threading
 import sqlite3
 from flask import Flask, request, jsonify
 from fiscal import create_fiscal_item
-import config  # Теперь файл config.py точно существует
+import config  # Импорт настроек из config.py
 
 app = Flask(__name__)
 
@@ -78,6 +78,7 @@ def create_invoice():
         if field not in request.form:
             return jsonify({"error": "-8", "error_note": f"Missing field: {field}"}), 400
     merchant_trans_id = request.form["merchant_trans_id"]
+    # При создании инвойса сумма передается так, как получена (в суммах)
     amount = float(request.form["amount"])
     phone_number = request.form["phone_number"]
     headers = {
@@ -94,9 +95,10 @@ def create_invoice():
         "merchant_trans_id": merchant_trans_id
     }
     try:
+        # Отправляем JSON-запрос
         resp = requests.post("https://api.click.uz/v2/merchant/invoice/create",
                              headers=headers,
-                             data=payload,
+                             json=payload,
                              timeout=30)
         if resp.status_code != 200:
             return jsonify({
@@ -225,4 +227,4 @@ def run_autopinger_thread():
 
 if __name__ == "__main__":
     run_autopinger_thread()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)

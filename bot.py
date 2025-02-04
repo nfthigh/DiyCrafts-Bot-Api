@@ -29,7 +29,7 @@ if not os.path.exists("config.py"):
     else:
         raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
 
-import config  # Импортируем настройки
+import config  # Импорт настроек
 
 API_TOKEN = config.TELEGRAM_BOT_TOKEN
 ADMIN_CHAT_IDS = config.ADMIN_CHAT_IDS
@@ -338,7 +338,8 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     if not price_text.isdigit():
         await message.reply("Цена должна быть числом.")
         return
-    # Цена вводится в суммах; для создания инвойса сумма передается как есть, а для фискализации переводится в тийины
+    # Цена вводится в суммах; для создания инвойса передаем сумму как есть,
+    # а для фискализации цена переводится в тийины (1 сум = 100 тийинов)
     admin_price_sum = float(price_text)
     admin_price_tiyin = admin_price_sum * 100
     data = await state.get_data()
@@ -356,15 +357,15 @@ async def process_admin_price(message: types.Message, state: FSMContext):
         await state.clear()
         return
     client_id, product, quantity = result
-    total_amount_sum = admin_price_sum * quantity  # итоговая сумма в суммах
-    total_amount = total_amount_sum  # для создания инвойса передаем сумму в суммах (как в тестовом примере)
+    total_amount_sum = admin_price_sum * quantity  # итоговая сумма в суммах (без умножения)
+    total_amount = total_amount_sum  # для создания инвойса передаем сумму в суммах
     inline_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Согласен", callback_data=f"client_accept_order_{order_id}")],
         [InlineKeyboardButton(text="❌ Отменить заказ", callback_data=f"client_cancel_order_{order_id}")]
     ])
     await bot.send_message(client_id, 
         f"Ваш заказ #{order_id} одобрен!\nЦена за единицу: {admin_price_sum} сум (преобразовано в {admin_price_tiyin} тийинов).\n"
-        f"Итоговая сумма: {total_amount_sum} сум ({total_amount} сум для инвойса).\nПодтверждаете заказ?",
+        f"Итоговая сумма: {total_amount_sum} сум (для инвойса: {total_amount} сум).\nПодтверждаете заказ?",
         reply_markup=inline_kb
     )
     await message.reply("Цена отправлена клиенту на подтверждение.")
@@ -395,11 +396,11 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     BASE_URL = f"{config.SELF_URL}/click-api"
     payload = {
         "merchant_trans_id": merchant_trans_id,
-        "amount": total_amount_sum,  # Передаем сумму в суммах
+        "amount": total_amount_sum,  # передаем сумму в суммах
         "phone_number": client_phone
     }
     try:
-        response = requests.post(f"{BASE_URL}/create_invoice", data=payload, timeout=30)
+        response = requests.post(f"{BASE_URL}/create_invoice", json=payload, timeout=30)
         invoice_response = response.json()
         print("Invoice response:", invoice_response)  # Логируем полный ответ
         payment_url = invoice_response.get("payment_url")
