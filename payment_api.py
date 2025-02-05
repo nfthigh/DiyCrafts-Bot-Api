@@ -26,9 +26,8 @@ basedir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(basedir)
 
 # Путь к файлу config.py
+basedir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(basedir, "config.py")
-
-# Если файла нет, создаём его из переменной окружения CONFIG_CONTENT
 if not os.path.exists(config_path):
     config_content = os.getenv("CONFIG_CONTENT")
     if config_content:
@@ -37,6 +36,7 @@ if not os.path.exists(config_path):
         logger.info("config.py создан из переменной окружения CONFIG_CONTENT")
     else:
         raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
+
 
 # Теперь импортируем настройки из config.py (файл должен быть создан)
 try:
