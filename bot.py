@@ -8,6 +8,7 @@ import uuid
 import requests
 import json
 from datetime import datetime
+from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -22,7 +23,9 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# Настроим логирование в консоль (stdout)
+# Загружаем переменные окружения из .env
+load_dotenv()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -30,7 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Определяем абсолютный путь до config.py и создаем его из CONFIG_CONTENT, если отсутствует
+# Определяем абсолютный путь до config.py и создаем его из переменной окружения CONFIG_CONTENT, если отсутствует
 basedir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(basedir, "config.py")
 if not os.path.exists(config_path):
@@ -44,26 +47,34 @@ if not os.path.exists(config_path):
 
 import config  # Импорт настроек из config.py
 
-# Параметры из config
-API_TOKEN = config.TELEGRAM_BOT_TOKEN
-ADMIN_CHAT_IDS = config.ADMIN_CHAT_IDS
-GROUP_CHAT_ID = config.GROUP_CHAT_ID
-SELF_URL = config.SELF_URL  # URL вашего сервера (если нужно для запросов)
+# Настройки из переменных окружения
+API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_CHAT_IDS = os.getenv("ADMIN_CHAT_IDS")
+# Если ADMIN_CHAT_IDS содержит несколько ID, разделенных запятой, преобразуем в список чисел:
+if ADMIN_CHAT_IDS:
+    ADMIN_CHAT_IDS = [int(x.strip()) for x in ADMIN_CHAT_IDS.split(",")]
+else:
+    ADMIN_CHAT_IDS = []
 
-# Подключение к PostgreSQL (используем переменную окружения DATABASE_URL)
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
+if GROUP_CHAT_ID:
+    GROUP_CHAT_ID = GROUP_CHAT_ID.strip()
+SELF_URL = os.getenv("SELF_URL")
+
+# Подключаемся к PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL не установлена")
 try:
     db_conn = psycopg2.connect(DATABASE_URL, sslmode='require')
     db_conn.autocommit = True
-    db_cursor = db_conn.cursor()
-    logger.info("Подключение к PostgreSQL выполнено успешно.")
+    db_cursor = db_conn.cursor(cursor_factory=RealDictCursor)
+    logger.info("Подключение к PostgreSQL выполнено успешно (бот).")
 except Exception as e:
-    logger.error("Ошибка подключения к PostgreSQL: %s", e)
+    logger.error("Ошибка подключения к PostgreSQL (бот): %s", e)
     raise
 
-# Создаем таблицы, если их нет (PostgreSQL)
+# Создаем таблицы, если их нет
 create_clients_table = """
 CREATE TABLE IF NOT EXISTS clients (
     user_id BIGINT PRIMARY KEY,
@@ -95,12 +106,12 @@ CREATE TABLE IF NOT EXISTS orders (
 try:
     db_cursor.execute(create_clients_table)
     db_cursor.execute(create_orders_table)
-    logger.info("Таблицы clients и orders успешно созданы или уже существуют.")
+    logger.info("Таблицы clients и orders созданы или уже существуют (бот).")
 except Exception as e:
-    logger.error("Ошибка создания таблиц: %s", e)
+    logger.error("Ошибка создания таблиц (бот): %s", e)
     raise
 
-# --- FSM состояния для бота ---
+# --- FSM состояния ---
 class OrderForm(StatesGroup):
     contact = State()
     name = State()
@@ -142,8 +153,8 @@ def get_product_keyboard():
     builder.adjust(2)
     return builder.as_markup()
 
-# --- Объединяем блок для формирования фискальных данных (из fiscal.py) ---
-# Здесь определяем словарь с данными товаров:
+# --- Блок формирования фискальных данных (из fiscal.py) ---
+# Определяем словарь с данными товаров:
 products_data = {
     "Кружка": {
         "SPIC": "06912001036000000",
@@ -157,7 +168,7 @@ products_data = {
     },
     "Кепка": {
         "SPIC": "06506001022000000",
-        "PackageCode": "1321746",
+        "PackageCode": "1324746",
         "CommissionInfo": {"TIN": "307022362"}
     },
     "Визитка": {
@@ -239,6 +250,7 @@ dp.include_router(router)
 async def send_welcome(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
+    db_cursor = db_conn.cursor(cursor_factory=RealDictCursor)
     db_cursor.execute("SELECT name, contact, username FROM clients WHERE user_id = %s", (user_id,))
     client = db_cursor.fetchone()
     is_admin = user_id in ADMIN_CHAT_IDS
@@ -248,7 +260,7 @@ async def send_welcome(message: types.Message, state: FSMContext):
         return
 
     if client:
-        user_name = client[0] if client[0] else "Неизвестный"
+        user_name = client.get("name") or "Неизвестный"
         welcome_message = f"👋 Добро пожаловать, {user_name}! Выберите опцию:"
         await message.answer(welcome_message, reply_markup=get_main_keyboard(is_admin, True))
         await message.answer("Выберите продукт:", reply_markup=get_product_keyboard())
@@ -288,6 +300,7 @@ async def register_name(message: types.Message, state: FSMContext):
     user_username = message.from_user.username or "Не указан"
     data = await state.get_data()
     contact = data.get('contact')
+    db_cursor = db_conn.cursor()
     db_cursor.execute("""
         INSERT INTO clients (user_id, username, contact, name)
         VALUES (%s, %s, %s, %s)
@@ -385,12 +398,13 @@ async def send_order_to_admin(user_id, state: FSMContext):
     location = data.get('location')
     delivery_comment = data.get('delivery_comment') or "Не указан"
 
+    db_cursor = db_conn.cursor(cursor_factory=RealDictCursor)
     db_cursor.execute("SELECT name, contact, username FROM clients WHERE user_id = %s", (user_id,))
     client = db_cursor.fetchone()
     if client:
-        user_name = client[0] if client[0] else "Неизвестный"
-        user_contact = client[1] if client[1] else "Не указан"
-        user_username = client[2] if client[2] else "Не указан"
+        user_name = client.get("name") or "Неизвестный"
+        user_contact = client.get("contact") or "Не указан"
+        user_username = client.get("username") or "Не указан"
     else:
         user_name = "Неизвестный"
         user_contact = "Не указан"
@@ -406,7 +420,7 @@ async def send_order_to_admin(user_id, state: FSMContext):
     db_conn.commit()
     db_cursor.execute("SELECT order_id FROM orders WHERE user_id = %s ORDER BY order_time DESC LIMIT 1", (user_id,))
     order_row = db_cursor.fetchone()
-    order_id = order_row[0] if order_row else None
+    order_id = order_row["order_id"] if order_row else None
     if not order_id:
         await bot.send_message(user_id, "Ошибка создания заказа.")
         return
@@ -419,12 +433,10 @@ async def send_order_to_admin(user_id, state: FSMContext):
         f"📝 <b>Дизайн:</b> {design_text}\n"
         f"🗒️ <b>Комментарий:</b> {delivery_comment}"
     )
-
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Одобрить", callback_data=f"approve_{order_id}")
     builder.button(text="❌ Отклонить", callback_data=f"reject_{order_id}")
     markup = builder.as_markup()
-
     for chat_id in ADMIN_CHAT_IDS + [GROUP_CHAT_ID]:
         try:
             await bot.send_message(chat_id, order_message, reply_markup=markup)
@@ -433,7 +445,6 @@ async def send_order_to_admin(user_id, state: FSMContext):
                 await bot.send_document(chat_id, design_photo)
         except Exception as e:
             logger.error(f"Error sending order to chat {chat_id}: {e}")
-
     await bot.send_message(
         user_id,
         "Ваш заказ отправлен. Ожидайте подтверждения.",
@@ -449,7 +460,7 @@ async def approve_order(callback_query: types.CallbackQuery, state: FSMContext):
     if admin_id not in ADMIN_CHAT_IDS:
         await callback_query.answer("У вас нет прав.", show_alert=True)
         return
-
+    db_cursor = db_conn.cursor(cursor_factory=RealDictCursor)
     db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Ожидание цены", order_id))
     db_conn.commit()
     await state.update_data(order_id=order_id)
@@ -469,6 +480,7 @@ async def process_admin_price(message: types.Message, state: FSMContext):
         await message.reply("Ошибка: заказ не найден.")
         await state.clear()
         return
+    db_cursor = db_conn.cursor()
     db_cursor.execute("UPDATE orders SET admin_price = %s WHERE order_id = %s", (admin_price_sum, order_id))
     db_conn.commit()
     logger.info(f"Цена {admin_price_sum} сум сохранена для заказа {order_id}.")
@@ -478,7 +490,9 @@ async def process_admin_price(message: types.Message, state: FSMContext):
         await message.reply("Ошибка: заказ не найден.")
         await state.clear()
         return
-    client_id, product, quantity = result
+    client_id = result["user_id"]
+    product = result["product"]
+    quantity = result["quantity"]
     total_amount_sum = admin_price_sum * quantity
     inline_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Согласен", callback_data=f"client_accept_order_{order_id}")],
@@ -497,6 +511,7 @@ async def process_admin_price(message: types.Message, state: FSMContext):
 async def client_accept_order(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
     order_id = int(callback_query.data.split('_')[-1])
+    db_cursor = db_conn.cursor(cursor_factory=RealDictCursor)
     db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Ожидание оплаты", order_id))
     db_conn.commit()
     db_cursor.execute("SELECT admin_price, product, quantity, user_id FROM orders WHERE order_id = %s", (order_id,))
@@ -504,7 +519,10 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     if not result:
         await callback_query.message.answer("Ошибка: заказ не найден.")
         return
-    admin_price_sum, product, quantity, user_id = result
+    admin_price_sum = float(result["admin_price"])
+    product = result["product"]
+    quantity = result["quantity"]
+    user_id = result["user_id"]
     unit_price_tiyin = admin_price_sum * 100
     total_amount_sum = admin_price_sum * quantity
 
@@ -514,12 +532,12 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
 
     db_cursor.execute("SELECT contact FROM clients WHERE user_id = %s", (user_id,))
     client_data = db_cursor.fetchone()
-    client_phone = client_data[0] if client_data and client_data[0] else ""
+    client_phone = client_data["contact"] if client_data and client_data.get("contact") else ""
 
-    BASE_URL = f"{config.SELF_URL}/click-api"
+    BASE_URL = f"{SELF_URL}/click-api"
     payload = {
         "merchant_trans_id": merchant_trans_id,
-        "amount": total_amount_sum,  # Сумма платежа в суммах
+        "amount": total_amount_sum,  # сумма платежа в суммах
         "phone_number": client_phone
     }
     logger.info("Отправляем запрос на создание инвойса с payload: %s", json.dumps(payload, indent=2))
@@ -551,7 +569,8 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
 async def client_cancel_order(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
     order_id = int(callback_query.data.split('_')[-1])
-    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ( "Отменён клиентом", order_id))
+    db_cursor = db_conn.cursor()
+    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Отменён клиентом", order_id))
     db_conn.commit()
     await callback_query.message.edit_text(f"Заказ #{order_id} отменён клиентом.")
 
@@ -563,12 +582,13 @@ async def reject_order(callback_query: types.CallbackQuery):
     if admin_id not in ADMIN_CHAT_IDS:
         await callback_query.answer("Нет прав.", show_alert=True)
         return
-    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ( "Отклонено", order_id))
+    db_cursor = db_conn.cursor()
+    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Отклонено", order_id))
     db_conn.commit()
     db_cursor.execute("SELECT user_id FROM orders WHERE order_id = %s", (order_id,))
     result = db_cursor.fetchone()
     if result:
-        client_id = result[0]
+        client_id = result["user_id"]
         await bot.send_message(client_id, f"Ваш заказ #{order_id} отклонён.")
     await callback_query.answer("Заказ отклонён.", show_alert=True)
 
