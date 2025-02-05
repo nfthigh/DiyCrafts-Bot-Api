@@ -1,9 +1,9 @@
 # bot.py
 import os
+import os.path
 import sys
 import logging
 import asyncio
-import sqlite3
 import uuid
 import requests
 import json
@@ -18,6 +18,9 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # Настроим логирование в консоль (stdout)
 logging.basicConfig(
@@ -39,124 +42,40 @@ if not os.path.exists(config_path):
     else:
         raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
 
-import config  # Импорт настроек
+import config  # Импорт настроек из config.py
 
 # Параметры из config
 API_TOKEN = config.TELEGRAM_BOT_TOKEN
 ADMIN_CHAT_IDS = config.ADMIN_CHAT_IDS
 GROUP_CHAT_ID = config.GROUP_CHAT_ID
-SELF_URL = config.SELF_URL  # URL для обращения к серверу
+SELF_URL = config.SELF_URL  # URL вашего сервера (если нужно для запросов)
 
-# --- Функция формирования фискальных данных (интегрированная версия fiscal.py) ---
-# Информация о товарах можно хранить отдельно или здесь
-products_data = {
-    "Кружка": {
-        "SPIC": "06912001036000000",
-        "PackageCode": "1184747",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Брелок": {
-        "SPIC": "07117001015000000",
-        "PackageCode": "1156259",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Кепка": {
-        "SPIC": "06506001022000000",
-        "PackageCode": "1324746",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Визитка": {
-        "SPIC": "04911001003000000",
-        "PackageCode": "1156221",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Футболка": {
-        "SPIC": "06109001001000000",
-        "PackageCode": "1124331",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Худи": {
-        "SPIC": "06212001012000000",
-        "PackageCode": "1238867",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Пазл": {
-        "SPIC": "04811001019000000",
-        "PackageCode": "1748791",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Камень": {
-        "SPIC": "04911001017000000",
-        "PackageCode": "1156234",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Стакан": {
-        "SPIC": "07013001008000000",
-        "PackageCode": "1345854",
-        "CommissionInfo": {"TIN": "307022362"}
-    }
-}
+# Подключение к PostgreSQL (используем переменную окружения DATABASE_URL)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise Exception("DATABASE_URL не установлена")
+try:
+    db_conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    db_conn.autocommit = True
+    db_cursor = db_conn.cursor()
+    logger.info("Подключение к PostgreSQL выполнено успешно.")
+except Exception as e:
+    logger.error("Ошибка подключения к PostgreSQL: %s", e)
+    raise
 
-def create_fiscal_item(product_name: str, quantity: int, unit_price: float) -> dict:
-    """
-    Формирует элемент фискальных данных для платежа.
-    
-    :param product_name: Название товара (например, "Кружка")
-    :param quantity: Количество товара (для фискализации фиксируем 1, если цена не зависит от количества)
-    :param unit_price: Цена за единицу (в тийинах)
-    :return: Словарь с фискальными данными
-    """
-    product = products_data.get(product_name)
-    if not product:
-        raise ValueError(f"Товар '{product_name}' не найден")
-    price_total = unit_price * quantity
-    vat = round((price_total / 1.12) * 0.12)
-    fiscal_item = {
-        "Name": product_name,
-        "SPIC": product["SPIC"],
-        "PackageCode": product["PackageCode"],
-        "GoodPrice": unit_price,  # Используем значение из БД
-        "Price": price_total,
-        "Amount": quantity,
-        "VAT": vat,
-        "VATPercent": 12,
-        "CommissionInfo": product["CommissionInfo"]
-    }
-    return fiscal_item
-
-# --- Конец блока fiscal ---
-
-# Инициализация бота
-bot = Bot(
-    token=API_TOKEN,
-    default=DefaultBotProperties(
-        parse_mode="HTML",
-        link_preview_is_disabled=False,
-        protect_content=False
-    )
-)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
-router = Router()
-dp.include_router(router)
-
-# Подключаемся к базе данных (один файл для бота и сервера, например, clients.db)
-conn = sqlite3.connect('clients.db', check_same_thread=False)
-cursor = conn.cursor()
-
-cursor.execute('''
+# Создаем таблицы, если их нет (PostgreSQL)
+create_clients_table = """
 CREATE TABLE IF NOT EXISTS clients (
-    user_id INTEGER PRIMARY KEY,
+    user_id BIGINT PRIMARY KEY,
     username TEXT,
     contact TEXT,
     name TEXT
 )
-''')
-# Обновлённая схема таблицы orders: добавлено поле unit_price
-cursor.execute('''
+"""
+create_orders_table = """
 CREATE TABLE IF NOT EXISTS orders (
-    order_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
+    order_id SERIAL PRIMARY KEY,
+    user_id BIGINT,
     product TEXT,
     quantity INTEGER,
     design_text TEXT,
@@ -169,16 +88,19 @@ CREATE TABLE IF NOT EXISTS orders (
     order_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     delivery_comment TEXT,
     admin_price REAL,
-    unit_price REAL,          -- новое поле для цены за единицу (тийины)
     payment_url TEXT,
-    is_paid INTEGER DEFAULT 0,
-    FOREIGN KEY (user_id) REFERENCES clients (user_id)
+    is_paid INTEGER DEFAULT 0
 )
-''')
-conn.commit()
-logger.info("База данных и таблицы инициализированы.")
+"""
+try:
+    db_cursor.execute(create_clients_table)
+    db_cursor.execute(create_orders_table)
+    logger.info("Таблицы clients и orders успешно созданы или уже существуют.")
+except Exception as e:
+    logger.error("Ошибка создания таблиц: %s", e)
+    raise
 
-# --- FSM состояния для оформления заказа ---
+# --- FSM состояния для бота ---
 class OrderForm(StatesGroup):
     contact = State()
     name = State()
@@ -220,14 +142,105 @@ def get_product_keyboard():
     builder.adjust(2)
     return builder.as_markup()
 
+# --- Объединяем блок для формирования фискальных данных (из fiscal.py) ---
+# Здесь определяем словарь с данными товаров:
+products_data = {
+    "Кружка": {
+        "SPIC": "06912001036000000",
+        "PackageCode": "1184747",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Брелок": {
+        "SPIC": "07117001015000000",
+        "PackageCode": "1156259",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Кепка": {
+        "SPIC": "06506001022000000",
+        "PackageCode": "1321746",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Визитка": {
+        "SPIC": "04911001003000000",
+        "PackageCode": "1156221",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Футболка": {
+        "SPIC": "06109001001000000",
+        "PackageCode": "1124331",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Худи": {
+        "SPIC": "06212001012000000",
+        "PackageCode": "1238867",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Пазл": {
+        "SPIC": "04811001019000000",
+        "PackageCode": "1748791",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Камень": {
+        "SPIC": "04911001017000000",
+        "PackageCode": "1156234",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Стакан": {
+        "SPIC": "07013001008000000",
+        "PackageCode": "1345854",
+        "CommissionInfo": {"TIN": "307022362"}
+    }
+}
+
+def create_fiscal_item(product_name: str, quantity: int, unit_price: float) -> dict:
+    """
+    Формирует элемент фискальных данных для платежа.
+    
+    :param product_name: Название товара (например, "Кружка")
+    :param quantity: Количество товара
+    :param unit_price: Цена за единицу (в тийинах)
+    :return: Словарь с фискальными данными
+    """
+    product = products_data.get(product_name)
+    if not product:
+        raise ValueError(f"Товар '{product_name}' не найден")
+    price_total = unit_price * quantity
+    vat = round((price_total / 1.12) * 0.12)
+    fiscal_item = {
+        "Name": product_name,
+        "SPIC": product["SPIC"],
+        "PackageCode": product["PackageCode"],
+        "GoodPrice": unit_price,
+        "Price": price_total,
+        "Amount": quantity,
+        "VAT": vat,
+        "VATPercent": 12,
+        "CommissionInfo": product["CommissionInfo"]
+    }
+    return fiscal_item
+
+# --- Инициализация бота ---
+bot = Bot(
+    token=API_TOKEN,
+    default=DefaultBotProperties(
+        parse_mode="HTML",
+        link_preview_is_disabled=False,
+        protect_content=False
+    )
+)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+router = Router()
+dp.include_router(router)
+
 # --- Обработчики бота ---
 
 @router.message(Command("start"))
 async def send_welcome(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    cursor.execute("SELECT name, contact, username FROM clients WHERE user_id=?", (user_id,))
-    client = cursor.fetchone()
+    db_cursor.execute("SELECT name, contact, username FROM clients WHERE user_id = %s", (user_id,))
+    client = db_cursor.fetchone()
     is_admin = user_id in ADMIN_CHAT_IDS
 
     if message.chat.type != ChatType.PRIVATE:
@@ -275,12 +288,12 @@ async def register_name(message: types.Message, state: FSMContext):
     user_username = message.from_user.username or "Не указан"
     data = await state.get_data()
     contact = data.get('contact')
-    cursor.execute("""
+    db_cursor.execute("""
         INSERT INTO clients (user_id, username, contact, name)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, contact=excluded.contact, name=excluded.name
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username, contact = EXCLUDED.contact, name = EXCLUDED.name
     """, (user_id, user_username, contact, user_name))
-    conn.commit()
+    db_conn.commit()
     await state.clear()
     is_admin = user_id in ADMIN_CHAT_IDS
     await message.answer(f"🎉 Спасибо за регистрацию, {user_name}!", reply_markup=get_main_keyboard(is_admin, True))
@@ -372,8 +385,8 @@ async def send_order_to_admin(user_id, state: FSMContext):
     location = data.get('location')
     delivery_comment = data.get('delivery_comment') or "Не указан"
 
-    cursor.execute("SELECT name, contact, username FROM clients WHERE user_id=?", (user_id,))
-    client = cursor.fetchone()
+    db_cursor.execute("SELECT name, contact, username FROM clients WHERE user_id = %s", (user_id,))
+    client = db_cursor.fetchone()
     if client:
         user_name = client[0] if client[0] else "Неизвестный"
         user_contact = client[1] if client[1] else "Не указан"
@@ -384,16 +397,20 @@ async def send_order_to_admin(user_id, state: FSMContext):
         user_username = "Не указан"
 
     order_time = datetime.now().strftime('%Y-%m-%d %H:%M')
-    cursor.execute("""
+    db_cursor.execute("""
         INSERT INTO orders (user_id, product, quantity, design_text, design_photo,
         location_lat, location_lon, order_time, delivery_comment, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Ожидание одобрения')
-    """, (
-        user_id, product, quantity, design_text, design_photo,
-        location.latitude, location.longitude, order_time, delivery_comment
-    ))
-    conn.commit()
-    order_id = cursor.lastrowid
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (user_id, product, quantity, design_text, design_photo,
+          location.latitude, location.longitude, order_time, delivery_comment, "Ожидание одобрения"))
+    db_conn.commit()
+    db_cursor.execute("SELECT order_id FROM orders WHERE user_id = %s ORDER BY order_time DESC LIMIT 1", (user_id,))
+    order_row = db_cursor.fetchone()
+    order_id = order_row[0] if order_row else None
+    if not order_id:
+        await bot.send_message(user_id, "Ошибка создания заказа.")
+        return
+
     order_message = (
         f"📣 <b>Новый заказ #{order_id}</b> 📣\n\n"
         f"👤 <b>Заказчик:</b> {user_name} (@{user_username}, {user_contact})\n"
@@ -402,12 +419,13 @@ async def send_order_to_admin(user_id, state: FSMContext):
         f"📝 <b>Дизайн:</b> {design_text}\n"
         f"🗒️ <b>Комментарий:</b> {delivery_comment}"
     )
+
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Одобрить", callback_data=f"approve_{order_id}")
     builder.button(text="❌ Отклонить", callback_data=f"reject_{order_id}")
     markup = builder.as_markup()
-    recipients = ADMIN_CHAT_IDS + [GROUP_CHAT_ID]
-    for chat_id in recipients:
+
+    for chat_id in ADMIN_CHAT_IDS + [GROUP_CHAT_ID]:
         try:
             await bot.send_message(chat_id, order_message, reply_markup=markup)
             await bot.send_location(chat_id, latitude=location.latitude, longitude=location.longitude)
@@ -415,6 +433,7 @@ async def send_order_to_admin(user_id, state: FSMContext):
                 await bot.send_document(chat_id, design_photo)
         except Exception as e:
             logger.error(f"Error sending order to chat {chat_id}: {e}")
+
     await bot.send_message(
         user_id,
         "Ваш заказ отправлен. Ожидайте подтверждения.",
@@ -430,10 +449,11 @@ async def approve_order(callback_query: types.CallbackQuery, state: FSMContext):
     if admin_id not in ADMIN_CHAT_IDS:
         await callback_query.answer("У вас нет прав.", show_alert=True)
         return
-    cursor.execute("UPDATE orders SET status='Ожидание цены' WHERE order_id=?", (order_id,))
-    conn.commit()
+
+    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Ожидание цены", order_id))
+    db_conn.commit()
     await state.update_data(order_id=order_id)
-    await callback_query.message.answer(f"Введите цену для заказа #{order_id} (в суммах):")
+    await callback_query.message.answer(f"Введите цену за единицу для заказа #{order_id} (в суммах):")
     await state.set_state(AdminPriceState.waiting_for_price)
 
 @router.message(AdminPriceState.waiting_for_price)
@@ -443,27 +463,31 @@ async def process_admin_price(message: types.Message, state: FSMContext):
         await message.reply("Цена должна быть числом.")
         return
     admin_price_sum = float(price_text)
-    # Вычисляем unit_price в тийинах (администраторская цена — это фиксированная цена за заказ)
-    unit_price = admin_price_sum * 100
     data = await state.get_data()
     order_id = data.get('order_id')
     if not order_id:
         await message.reply("Ошибка: заказ не найден.")
         await state.clear()
         return
-    # Обновляем поля: admin_price и unit_price
-    cursor.execute("UPDATE orders SET admin_price=?, unit_price=? WHERE order_id=?", (admin_price_sum, unit_price, order_id))
-    conn.commit()
-    logger.info(f"Цена {admin_price_sum} сум и unit_price {unit_price} тийинов сохранены для заказа {order_id}.")
-    # Здесь итоговая сумма равна фиксированной цене, независимо от введённого клиентом количества
-    total_amount_sum = admin_price_sum
+    db_cursor.execute("UPDATE orders SET admin_price = %s WHERE order_id = %s", (admin_price_sum, order_id))
+    db_conn.commit()
+    logger.info(f"Цена {admin_price_sum} сум сохранена для заказа {order_id}.")
+    db_cursor.execute("SELECT user_id, product, quantity FROM orders WHERE order_id = %s", (order_id,))
+    result = db_cursor.fetchone()
+    if not result:
+        await message.reply("Ошибка: заказ не найден.")
+        await state.clear()
+        return
+    client_id, product, quantity = result
+    total_amount_sum = admin_price_sum * quantity
     inline_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Согласен", callback_data=f"client_accept_order_{order_id}")],
         [InlineKeyboardButton(text="❌ Отменить заказ", callback_data=f"client_cancel_order_{order_id}")]
     ])
     await bot.send_message(
-        cursor.execute("SELECT user_id FROM orders WHERE order_id=?", (order_id,)).fetchone()[0],
-        f"Ваш заказ #{order_id} одобрен!\nЦена: {admin_price_sum} сум.\nПодтверждаете заказ?",
+        client_id,
+        f"Ваш заказ #{order_id} одобрен!\nЦена за единицу: {admin_price_sum} сум (преобразовано в {admin_price_sum * 100} тийинов).\n"
+        f"Итоговая сумма: {total_amount_sum} сум.\nПодтверждаете заказ?",
         reply_markup=inline_kb
     )
     await message.reply("Цена отправлена клиенту на подтверждение.")
@@ -473,31 +497,29 @@ async def process_admin_price(message: types.Message, state: FSMContext):
 async def client_accept_order(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
     order_id = int(callback_query.data.split('_')[-1])
-    cursor.execute("UPDATE orders SET status='Ожидание оплаты' WHERE order_id=?", (order_id,))
-    conn.commit()
-    cursor.execute("SELECT admin_price, product, user_id FROM orders WHERE order_id=?", (order_id,))
-    result = cursor.fetchone()
+    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Ожидание оплаты", order_id))
+    db_conn.commit()
+    db_cursor.execute("SELECT admin_price, product, quantity, user_id FROM orders WHERE order_id = %s", (order_id,))
+    result = db_cursor.fetchone()
     if not result:
         await callback_query.message.answer("Ошибка: заказ не найден.")
         return
-    admin_price_sum, product, user_id = result
-    # Фиксируем unit_price как admin_price_sum * 100 и итоговую сумму равной admin_price_sum (игнорируем введённое клиентом количество)
-    unit_price = admin_price_sum * 100
-    total_amount_sum = admin_price_sum
+    admin_price_sum, product, quantity, user_id = result
+    unit_price_tiyin = admin_price_sum * 100
+    total_amount_sum = admin_price_sum * quantity
 
-    # Генерируем уникальный merchant_trans_id (UUID)
     merchant_trans_id = str(uuid.uuid4())
-    cursor.execute("UPDATE orders SET merchant_trans_id=? WHERE order_id=?", (merchant_trans_id, order_id))
-    conn.commit()
+    db_cursor.execute("UPDATE orders SET merchant_trans_id = %s WHERE order_id = %s", (merchant_trans_id, order_id))
+    db_conn.commit()
 
-    cursor.execute("SELECT contact FROM clients WHERE user_id=?", (user_id,))
-    client_data = cursor.fetchone()
+    db_cursor.execute("SELECT contact FROM clients WHERE user_id = %s", (user_id,))
+    client_data = db_cursor.fetchone()
     client_phone = client_data[0] if client_data and client_data[0] else ""
 
     BASE_URL = f"{config.SELF_URL}/click-api"
     payload = {
         "merchant_trans_id": merchant_trans_id,
-        "amount": total_amount_sum,  # сумма в суммах
+        "amount": total_amount_sum,  # Сумма платежа в суммах
         "phone_number": client_phone
     }
     logger.info("Отправляем запрос на создание инвойса с payload: %s", json.dumps(payload, indent=2))
@@ -512,13 +534,14 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
         if not payment_url:
             await callback_query.message.answer("Ошибка создания инвойса. Детали: " + json.dumps(invoice_response), parse_mode=None)
             return
-        cursor.execute("UPDATE orders SET payment_url=? WHERE order_id=?", (payment_url, order_id))
-        conn.commit()
+        db_cursor.execute("UPDATE orders SET payment_url = %s WHERE order_id = %s", (payment_url, order_id))
+        db_conn.commit()
         inline_kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 Оплатить", url=payment_url)]
         ])
         await callback_query.message.edit_text(
-            f"Заказ #{order_id} подтвержден.\nЦена: {admin_price_sum} сум.\nНажмите кнопку ниже для оплаты.",
+            f"Заказ #{order_id} подтвержден.\nЦена за единицу: {admin_price_sum} сум (преобразовано в {unit_price_tiyin} тийинов).\n"
+            f"Итоговая сумма: {total_amount_sum} сум.\nНажмите кнопку ниже для оплаты.",
             reply_markup=inline_kb
         )
     except Exception as e:
@@ -528,8 +551,8 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
 async def client_cancel_order(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
     order_id = int(callback_query.data.split('_')[-1])
-    cursor.execute("UPDATE orders SET status='Отменён клиентом' WHERE order_id=?", (order_id,))
-    conn.commit()
+    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ( "Отменён клиентом", order_id))
+    db_conn.commit()
     await callback_query.message.edit_text(f"Заказ #{order_id} отменён клиентом.")
 
 @router.callback_query(lambda c: c.data and c.data.startswith("reject_"))
@@ -540,10 +563,10 @@ async def reject_order(callback_query: types.CallbackQuery):
     if admin_id not in ADMIN_CHAT_IDS:
         await callback_query.answer("Нет прав.", show_alert=True)
         return
-    cursor.execute("UPDATE orders SET status='Отклонено' WHERE order_id=?", (order_id,))
-    conn.commit()
-    cursor.execute("SELECT user_id FROM orders WHERE order_id=?", (order_id,))
-    result = cursor.fetchone()
+    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ( "Отклонено", order_id))
+    db_conn.commit()
+    db_cursor.execute("SELECT user_id FROM orders WHERE order_id = %s", (order_id,))
+    result = db_cursor.fetchone()
     if result:
         client_id = result[0]
         await bot.send_message(client_id, f"Ваш заказ #{order_id} отклонён.")

@@ -3,6 +3,15 @@ import os
 import os.path
 import sys
 import logging
+import time
+import hashlib
+import json
+import requests
+import threading
+import psycopg2
+from flask import Flask, request, jsonify
+from fiscal import create_fiscal_item  # функция из fiscal.py
+import config  # Импорт настроек из config.py
 
 # Настроим логирование в консоль (stdout)
 logging.basicConfig(
@@ -24,16 +33,6 @@ if not os.path.exists(config_path):
     else:
         raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
 
-import time
-import hashlib
-import json
-import requests
-import threading
-import sqlite3
-from flask import Flask, request, jsonify
-from fiscal import create_fiscal_item  # Функция формирования фискальных данных
-import config  # Импорт настроек из config.py
-
 app = Flask(__name__)
 app.logger = logger
 
@@ -46,14 +45,23 @@ TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
 GROUP_CHAT_ID = config.GROUP_CHAT_ID
 SELF_URL = config.SELF_URL
 
-# Подключаемся к базе данных (файл clients.db должен сохраняться между запусками)
-conn = sqlite3.connect('clients.db', check_same_thread=False)
-cursor = conn.cursor()
+# Подключаемся к PostgreSQL базе данных
+DATABASE_URL = os.getenv("DATABASE_URL")  # убедитесь, что эта переменная установлена
+if not DATABASE_URL:
+    raise Exception("DATABASE_URL не установлена")
+try:
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    conn.autocommit = True
+    cursor = conn.cursor()
+    logger.info("Подключение к PostgreSQL выполнено успешно.")
+except Exception as e:
+    logger.error("Ошибка подключения к PostgreSQL: %s", e)
+    raise
 
-# Обновлённая схема таблицы orders: добавлено поле unit_price (тийины)
-cursor.execute("""
+# Создание таблицы orders (если не существует) для PostgreSQL
+create_table_query = """
 CREATE TABLE IF NOT EXISTS orders (
-    order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id SERIAL PRIMARY KEY,
     user_id INTEGER,
     product TEXT,
     quantity INTEGER,
@@ -67,14 +75,16 @@ CREATE TABLE IF NOT EXISTS orders (
     order_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     delivery_comment TEXT,
     admin_price REAL,
-    unit_price REAL,           -- новое поле для цены за единицу (тийины)
     payment_url TEXT,
-    is_paid INTEGER DEFAULT 0,
-    FOREIGN KEY (user_id) REFERENCES clients (user_id)
+    is_paid INTEGER DEFAULT 0
 )
-""")
-conn.commit()
-app.logger.info("База данных и таблица orders инициализированы.")
+"""
+try:
+    cursor.execute(create_table_query)
+    logger.info("Таблица orders создана или уже существует.")
+except Exception as e:
+    logger.error("Ошибка создания таблицы orders: %s", e)
+    raise
 
 def generate_auth_header():
     timestamp = str(int(time.time()))
@@ -123,7 +133,7 @@ def create_invoice():
     }
     payload = {
         "service_id": SERVICE_ID,
-        "amount": amount,  # сумма платежа в суммах
+        "amount": amount,
         "phone_number": phone_number,
         "merchant_trans_id": merchant_trans_id
     }
@@ -162,11 +172,14 @@ def prepare():
     click_trans_id = request.form["click_trans_id"]
     merchant_trans_id = request.form["merchant_trans_id"]
     app.logger.info("Prepare: click_trans_id=%s, merchant_trans_id=%s", click_trans_id, merchant_trans_id)
-    cursor.execute("UPDATE orders SET status=?, cost_info=? WHERE merchant_trans_id=?",
-                   ("pending", click_trans_id, merchant_trans_id))
+    # Обновляем заказ; в PostgreSQL синтаксис UPDATE такой же
+    cursor.execute("""
+        UPDATE orders SET status=%s, cost_info=%s WHERE merchant_trans_id=%s
+        """, ("pending", click_trans_id, merchant_trans_id))
     if cursor.rowcount == 0:
-        cursor.execute("INSERT INTO orders (merchant_trans_id, status, cost_info) VALUES (?, ?, ?)",
-                       (merchant_trans_id, "pending", click_trans_id))
+        cursor.execute("""
+            INSERT INTO orders (merchant_trans_id, status, cost_info) VALUES (%s, %s, %s)
+            """, (merchant_trans_id, "pending", click_trans_id))
         app.logger.info("Новый заказ создан в режиме prepare.")
     else:
         app.logger.info("Заказ обновлён в режиме prepare.")
@@ -201,66 +214,74 @@ def complete():
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Создаем новое соединение с базой данных для получения актуальных данных
-    new_conn = sqlite3.connect('clients.db')
-    new_cursor = new_conn.cursor()
-
-    # Извлекаем admin_price и unit_price из базы
-    new_cursor.execute("SELECT admin_price, unit_price FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
-    row = new_cursor.fetchone()
+    # Получаем unit_price исключительно из БД (admin_price вводится администратором в суммах)
+    cursor.execute("SELECT admin_price FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
+    row = cursor.fetchone()
     app.logger.info("Данные заказа для unit_price: %s", row)
-    if row and row[0] is not None and row[1] is not None:
+    if row and row[0]:
         admin_price = float(row[0])
-        unit_price = float(row[1])
+        unit_price = admin_price * 100  # переводим в тийины
         app.logger.info("unit_price взят из БД: admin_price=%s, unit_price=%s", admin_price, unit_price)
     else:
-        error_msg = "Цена заказа не установлена. Пожалуйста, дождитесь подтверждения администратора."
+        error_msg = "Missing field: unit_price and не удалось извлечь из БД"
         app.logger.error(error_msg)
-        new_conn.close()
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Для фискализации игнорируем значение количества, фиксируем его равным 1
-    fiscal_quantity = 1
+    # Получаем quantity: если отсутствует в запросе, берем из БД
+    quantity_str = request.form.get("quantity")
+    if quantity_str:
+        try:
+            quantity = int(quantity_str)
+        except Exception as e:
+            error_msg = f"Ошибка преобразования quantity: {e}"
+            app.logger.error(error_msg)
+            return jsonify({"error": "-8", "error_note": error_msg}), 400
+    else:
+        cursor.execute("SELECT quantity FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
+        row = cursor.fetchone()
+        if row and row[0]:
+            quantity = row[0]
+            app.logger.info("Количество (quantity) взято из БД: %s", quantity)
+        else:
+            error_msg = "Missing field: quantity and не удалось извлечь из БД"
+            app.logger.error(error_msg)
+            return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Получаем название товара
-    new_cursor.execute("SELECT product FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
-    row = new_cursor.fetchone()
+    # Получаем название товара из заказа (из поля product)
+    cursor.execute("SELECT product FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
+    row = cursor.fetchone()
     if row and row[0]:
         product_name = row[0]
     else:
         product_name = "Неизвестный товар"
 
     app.logger.info(
-        "Параметры /complete: click_trans_id=%s, merchant_trans_id=%s, amount=%s, product_name=%s, fiscal_quantity=%s, unit_price=%s",
-        click_trans_id, merchant_trans_id, amount, product_name, fiscal_quantity, unit_price
+        "Параметры /complete: click_trans_id=%s, merchant_trans_id=%s, amount=%s, product_name=%s, quantity=%s, unit_price=%s",
+        click_trans_id, merchant_trans_id, amount, product_name, quantity, unit_price
     )
 
-    new_cursor.execute("SELECT * FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
-    order_row = new_cursor.fetchone()
+    cursor.execute("SELECT * FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
+    order_row = cursor.fetchone()
     app.logger.info("Содержимое заказа: %s", order_row)
     if not order_row:
         error_msg = "Order not found"
         app.logger.error(error_msg)
-        new_conn.close()
         return jsonify({"error": "-5", "error_note": error_msg}), 404
     if order_row[-1] == 1:
         error_msg = "Already paid"
         app.logger.error(error_msg)
-        new_conn.close()
         return jsonify({"error": "-4", "error_note": error_msg}), 400
 
-    new_cursor.execute("UPDATE orders SET is_paid=1, status='processing' WHERE merchant_trans_id=?", (merchant_trans_id,))
-    new_conn.commit()
+    cursor.execute("UPDATE orders SET is_paid=1, status='processing' WHERE merchant_trans_id=%s", (merchant_trans_id,))
+    conn.commit()
 
     try:
-        # Формируем фискальный элемент, где GoodPrice = unit_price и количество фиксировано равным 1
-        fiscal_item = create_fiscal_item(product_name, fiscal_quantity, unit_price)
+        fiscal_item = create_fiscal_item(product_name, quantity, unit_price)
         fiscal_items = [fiscal_item]
         app.logger.info("Фискальные данные сформированы: %s", json.dumps(fiscal_items, indent=2, ensure_ascii=False))
     except Exception as e:
         error_msg = f"Ошибка формирования фискальных данных: {e}"
         app.logger.error(error_msg)
-        new_conn.close()
         return jsonify({"error": "-10", "error_note": error_msg}), 400
 
     fiscal_headers = {
@@ -274,7 +295,7 @@ def complete():
         "service_id": SERVICE_ID,
         "payment_id": click_trans_id,
         "items": fiscal_items,
-        "received_ecash": amount,  # сумма платежа в суммах
+        "received_ecash": amount,  # сумма платежа в суммах (без преобразования)
         "received_cash": 0,
         "received_card": 0
     }
@@ -294,9 +315,8 @@ def complete():
         fiscal_result = {"error_code": -1, "error_note": str(e)}
         app.logger.error("Исключение при фискализации: %s", e)
 
-    new_cursor.execute("UPDATE orders SET status='completed' WHERE merchant_trans_id=?", (merchant_trans_id,))
-    new_conn.commit()
-    new_conn.close()
+    cursor.execute("UPDATE orders SET status='completed' WHERE merchant_trans_id=%s", (merchant_trans_id,))
+    conn.commit()
 
     response = {
         "click_trans_id": click_trans_id,
