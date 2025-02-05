@@ -31,7 +31,7 @@ import requests
 import threading
 import sqlite3
 from flask import Flask, request, jsonify
-from fiscal import create_fiscal_item
+from fiscal import create_fiscal_item  # Функция формирования фискальных данных
 import config  # Импорт настроек из config.py
 
 app = Flask(__name__)
@@ -50,6 +50,7 @@ SELF_URL = config.SELF_URL
 conn = sqlite3.connect('clients.db', check_same_thread=False)
 cursor = conn.cursor()
 
+# Обновлённая схема таблицы orders: добавлено поле unit_price (тийины)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS orders (
     order_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +67,7 @@ CREATE TABLE IF NOT EXISTS orders (
     order_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     delivery_comment TEXT,
     admin_price REAL,
+    unit_price REAL,           -- новое поле для цены за единицу (тийины)
     payment_url TEXT,
     is_paid INTEGER DEFAULT 0,
     FOREIGN KEY (user_id) REFERENCES clients (user_id)
@@ -121,7 +123,7 @@ def create_invoice():
     }
     payload = {
         "service_id": SERVICE_ID,
-        "amount": amount,  # сумма платежа в суммах, как требует Merchant API
+        "amount": amount,  # сумма платежа в суммах
         "phone_number": phone_number,
         "merchant_trans_id": merchant_trans_id
     }
@@ -199,16 +201,16 @@ def complete():
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Получаем unit_price исключительно из БД (администратор вводит цену в суммах)
-    cursor.execute("SELECT admin_price FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
+    # Извлекаем admin_price и unit_price из БД
+    cursor.execute("SELECT admin_price, unit_price FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
     row = cursor.fetchone()
     app.logger.info("Данные заказа для unit_price: %s", row)
-    if row and row[0]:
+    if row and row[0] is not None and row[1] is not None:
         admin_price = float(row[0])
-        unit_price = admin_price * 100  # переводим в тийины
+        unit_price = float(row[1])
         app.logger.info("unit_price взят из БД: admin_price=%s, unit_price=%s", admin_price, unit_price)
     else:
-        error_msg = "Missing field: unit_price and не удалось извлечь из БД"
+        error_msg = "Цена заказа не установлена. Обратитесь к администратору или попробуйте позже."
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
@@ -232,7 +234,7 @@ def complete():
             app.logger.error(error_msg)
             return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Получаем название товара из заказа (из поля product)
+    # Получаем название товара
     cursor.execute("SELECT product FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
     row = cursor.fetchone()
     if row and row[0]:
@@ -261,6 +263,7 @@ def complete():
     conn.commit()
 
     try:
+        # Формируем фискальный элемент, где GoodPrice = unit_price (тийины)
         fiscal_item = create_fiscal_item(product_name, quantity, unit_price)
         fiscal_items = [fiscal_item]
         app.logger.info("Фискальные данные сформированы: %s", json.dumps(fiscal_items, indent=2, ensure_ascii=False))

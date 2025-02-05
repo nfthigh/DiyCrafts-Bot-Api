@@ -45,10 +45,10 @@ import config  # Импорт настроек
 API_TOKEN = config.TELEGRAM_BOT_TOKEN
 ADMIN_CHAT_IDS = config.ADMIN_CHAT_IDS
 GROUP_CHAT_ID = config.GROUP_CHAT_ID
-SELF_URL = config.SELF_URL  # Этот URL используется для обращения к серверу, если нужно
+SELF_URL = config.SELF_URL  # URL для обращения к серверу
 
 # --- Функция формирования фискальных данных (интегрированная версия fiscal.py) ---
-# Здесь хранится информация о товарах; создайте файл products.py с переменной products_data или определите её здесь.
+# Здесь хранится информация о товарах; можно вынести в отдельный файл products.py или оставить здесь.
 products_data = {
     "Кружка": {
         "SPIC": "06912001036000000",
@@ -62,7 +62,7 @@ products_data = {
     },
     "Кепка": {
         "SPIC": "06506001022000000",
-        "PackageCode": "1324746",  # Проверьте корректность данных
+        "PackageCode": "1324746",
         "CommissionInfo": {"TIN": "307022362"}
     },
     "Визитка": {
@@ -103,19 +103,20 @@ def create_fiscal_item(product_name: str, quantity: int, unit_price: float) -> d
     
     :param product_name: Название товара (например, "Кружка")
     :param quantity: Количество товара
-    :param unit_price: Цена за единицу, введённая администратором (в тийинах)
+    :param unit_price: Цена за единицу (в тийинах)
     :return: Словарь с фискальными данными
     """
     product = products_data.get(product_name)
     if not product:
         raise ValueError(f"Товар '{product_name}' не найден")
     price_total = unit_price * quantity
+    # Вычисляем НДС: предполагается, что ставка 12%
     vat = round((price_total / 1.12) * 0.12)
     fiscal_item = {
         "Name": product_name,
         "SPIC": product["SPIC"],
         "PackageCode": product["PackageCode"],
-        "GoodPrice": unit_price,  # Цена за единицу (в тийинах)
+        "GoodPrice": unit_price,  # Значение из базы (тийины)
         "Price": price_total,
         "Amount": quantity,
         "VAT": vat,
@@ -124,7 +125,7 @@ def create_fiscal_item(product_name: str, quantity: int, unit_price: float) -> d
     }
     return fiscal_item
 
-# --- Конец объединённого блока fiscal ---
+# --- Конец блока fiscal ---
 
 # Инициализация бота
 bot = Bot(
@@ -152,6 +153,7 @@ CREATE TABLE IF NOT EXISTS clients (
     name TEXT
 )
 ''')
+# Обновлённая схема таблицы orders: добавлено поле unit_price
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS orders (
     order_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,6 +170,7 @@ CREATE TABLE IF NOT EXISTS orders (
     order_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     delivery_comment TEXT,
     admin_price REAL,
+    unit_price REAL,          -- новое поле для цены за единицу (тийины)
     payment_url TEXT,
     is_paid INTEGER DEFAULT 0,
     FOREIGN KEY (user_id) REFERENCES clients (user_id)
@@ -441,16 +444,18 @@ async def process_admin_price(message: types.Message, state: FSMContext):
         await message.reply("Цена должна быть числом.")
         return
     admin_price_sum = float(price_text)
-    admin_price_tiyin = admin_price_sum * 100
+    # Вычисляем unit_price в тийинах
+    unit_price = admin_price_sum * 100
     data = await state.get_data()
     order_id = data.get('order_id')
     if not order_id:
         await message.reply("Ошибка: заказ не найден.")
         await state.clear()
         return
-    cursor.execute("UPDATE orders SET admin_price=? WHERE order_id=?", (admin_price_sum, order_id))
+    # Обновляем сразу два поля: admin_price (суммы) и unit_price (тийины)
+    cursor.execute("UPDATE orders SET admin_price=?, unit_price=? WHERE order_id=?", (admin_price_sum, unit_price, order_id))
     conn.commit()
-    logger.info(f"Цена {admin_price_sum} сум сохранена для заказа {order_id}.")
+    logger.info(f"Цена {admin_price_sum} сум и unit_price {unit_price} тийинов сохранены для заказа {order_id}.")
     cursor.execute("SELECT user_id, product, quantity FROM orders WHERE order_id=?", (order_id,))
     result = cursor.fetchone()
     if not result:
@@ -465,7 +470,7 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     ])
     await bot.send_message(
         client_id,
-        f"Ваш заказ #{order_id} одобрен!\nЦена за единицу: {admin_price_sum} сум (преобразовано в {admin_price_tiyin} тийинов).\n"
+        f"Ваш заказ #{order_id} одобрен!\nЦена за единицу: {admin_price_sum} сум (GoodPrice = {unit_price} тийинов).\n"
         f"Итоговая сумма: {total_amount_sum} сум.\nПодтверждаете заказ?",
         reply_markup=inline_kb
     )
@@ -484,7 +489,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
         await callback_query.message.answer("Ошибка: заказ не найден.")
         return
     admin_price_sum, product, quantity, user_id = result
-    unit_price_tiyin = admin_price_sum * 100
+    unit_price = admin_price_sum * 100
     total_amount_sum = admin_price_sum * quantity
 
     # Генерируем уникальный merchant_trans_id (UUID)
@@ -520,7 +525,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
             [InlineKeyboardButton(text="💳 Оплатить", url=payment_url)]
         ])
         await callback_query.message.edit_text(
-            f"Заказ #{order_id} подтвержден.\nЦена за единицу: {admin_price_sum} сум (преобразовано в {unit_price_tiyin} тийинов).\n"
+            f"Заказ #{order_id} подтвержден.\nЦена за единицу: {admin_price_sum} сум (GoodPrice = {unit_price} тийинов).\n"
             f"Итоговая сумма: {total_amount_sum} сум.\nНажмите кнопку ниже для оплаты.",
             reply_markup=inline_kb
         )
