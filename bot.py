@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Параметры WooCommerce
+# Получаем параметры WooCommerce из .env
 WC_SITE_URL = os.getenv("WC_SITE_URL")
 if not WC_SITE_URL:
     raise Exception("WC_SITE_URL не установлен в .env")
@@ -72,7 +72,7 @@ except Exception as e:
     logger.error("Ошибка подключения к PostgreSQL (бот): %s", e)
     raise
 
-# Создание таблиц
+# Создание таблиц, если их нет
 create_clients_table = """
 CREATE TABLE IF NOT EXISTS clients (
     user_id BIGINT PRIMARY KEY,
@@ -109,7 +109,7 @@ except Exception as e:
     logger.error("Ошибка создания таблиц (бот): %s", e)
     raise
 
-# FSM
+# Определяем FSM для заказа
 class OrderForm(StatesGroup):
     contact = State()
     name = State()
@@ -155,7 +155,7 @@ def get_product_keyboard():
     builder.adjust(2)
     return builder.as_markup()
 
-# Данные для товаров
+# Пример данных для товаров (фискальные данные)
 products_data = {
     "Кружка": {
         "SPIC": "06912001036000000",  # SKU
@@ -223,7 +223,7 @@ def create_fiscal_item(product_name: str, quantity: int, unit_price: float) -> d
     }
     return fiscal_item
 
-# Глобальная сессия с tenacity для повторных попыток
+# Создаем глобальную сессию с повторными попытками
 session = requests.Session()
 session.auth = (WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
 
@@ -291,9 +291,11 @@ async def send_welcome(message: types.Message, state: FSMContext):
     cur.execute("SELECT name, contact, username FROM clients WHERE user_id = %s", (user_id,))
     client = cur.fetchone()
     is_admin = user_id in ADMIN_CHAT_IDS
+
     if message.chat.type != ChatType.PRIVATE:
         await message.reply("Пожалуйста, напишите мне в личные сообщения для регистрации.")
         return
+
     if client:
         user_name = client.get("name") or "Уважаемый клиент"
         welcome_message = f"👋 Здравствуйте, {user_name}! Добро пожаловать в наш премиальный сервис заказов."
@@ -345,7 +347,7 @@ async def register_name(message: types.Message, state: FSMContext):
     await state.clear()
     is_admin = user_id in ADMIN_CHAT_IDS
     await message.answer(f"🎉 Спасибо за регистрацию, {user_name}!", reply_markup=get_main_keyboard(is_admin, True))
-    await message.answer("🌟 Пожалуйста, выберите товар из нашего ассортимента:", reply_markup=get_product_keyboard())
+    await message.answer("🌟 Пожалуйста, выберите товар из нашего асс assortimента:", reply_markup=get_product_keyboard())
     await state.set_state(OrderForm.product)
 
 # --- Обработка выбора товара и создание заказа ---
@@ -551,7 +553,6 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     product = result["product"]
     quantity = result["quantity"]
     total_amount_sum = admin_price_sum * quantity
-
     inline_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Оплата Click", callback_data=f"client_payment_click_{order_id}")],
         [InlineKeyboardButton(text="💳 Оплата Payme", callback_data=f"client_payment_payme_{order_id}")],
@@ -630,11 +631,6 @@ async def client_payment_click(callback_query: types.CallbackQuery, state: FSMCo
 @router.callback_query(lambda c: c.data and c.data.startswith("client_payment_payme_"))
 async def client_payment_payme(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
-    # Сразу отправляем уведомление о задержке (со стороны сервера)
-    await bot.send_message(
-        callback_query.from_user.id,
-        "⚠️ Пожалуйста, подождите немного... Возможна небольшая задержка со стороны сервера 😃🙏"
-    )
     order_id = int(callback_query.data.split('_')[-1])
     db_cursor = db_conn.cursor(cursor_factory=RealDictCursor)
     db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Ожидание оплаты (Payme)", order_id))
@@ -658,6 +654,7 @@ async def client_payment_payme(callback_query: types.CallbackQuery, state: FSMCo
     client_data = db_cursor.fetchone()
     client_phone = client_data["contact"] if client_data and client_data.get("contact") else ""
 
+    # Поиск или создание товара в WooCommerce
     try:
         product_id = find_or_create_product(product)
     except Exception as e:
@@ -698,28 +695,27 @@ async def client_payment_payme(callback_query: types.CallbackQuery, state: FSMCo
     }
 
     try:
-        response = session.post(f"{WC_API_URL}/orders", json=orderData, timeout=400)
+        response = session.post(f"{WC_API_URL}/orders", json=orderData, timeout=30)
         wc_order = response.json()
         order_wc_id = wc_order.get("id")
         order_key = wc_order.get("order_key")
         if not order_wc_id or not order_key:
             await callback_query.message.answer("🚫 Ошибка создания заказа в WooCommerce. Детали: " + json.dumps(wc_order))
             return
-        # Формируем ссылку на авто-редирект через Flask-сервер
-        your_render_app_url = "https://diycrafts-bot-api.onrender.com"  # Замените на URL вашего сервера
-        merchant_id = "6758399fd33fb8548cede2a7"  # Ваш мерчант ID
-        callback_url = f"{WC_SITE_URL.rstrip('/')}/cart/?payme_success=1&order_id={order_id}"
-        redirect_url = (
-            f"{your_render_app_url}/auto_payme?"
-            f"order_id={order_id}&amount={total_amount_sum:.2f}&merchant={merchant_id}&callback={callback_url}&lang=ru"
-        )
-        db_cursor.execute("UPDATE orders SET payment_url = %s WHERE order_id = %s", (redirect_url, order_id))
+        payUrl = f"{WC_SITE_URL.rstrip('/')}/checkout/order-pay/{order_wc_id}/?key={order_key}&order_pay={order_wc_id}"
+        db_cursor.execute("UPDATE orders SET payment_url = %s WHERE order_id = %s", (payUrl, order_id))
         db_conn.commit()
         inline_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплатить", url=redirect_url)]
+            [InlineKeyboardButton(text="💳 Оплатить", url=payUrl)]
         ])
-        logger.info("Заказ создан в WooCommerce. order_id: %s, order_wc_id: %s, order_key: %s, redirect_url: %s",
-                    order_id, order_wc_id, order_key, redirect_url)
+        logger.info("Заказ создан в WooCommerce. order_id: %s, order_wc_id: %s, order_key: %s, payUrl: %s",
+                    order_id, order_wc_id, order_key, payUrl)
+        # Отправляем дополнительное сообщение с дружелюбным уведомлением о задержке
+        await bot.send_message(
+            callback_query.from_user.id,
+            "⚠️ Пожалуйста, подождите немного... Возможна небольшая задержка с нашей стороны 😃🙏",
+        )
+        # Отправляем новое сообщение с кнопкой для оплаты
         await bot.send_message(
             callback_query.from_user.id,
             f"💎 Ваш заказ №{order_id} успешно оформлен!\n"
@@ -786,7 +782,7 @@ async def show_my_orders(message: types.Message):
     response_text = "📦 Ваши заказы:\n" + "\n".join(response_lines)
     await message.answer(response_text, reply_markup=get_main_keyboard(message.from_user.id in ADMIN_CHAT_IDS, True))
 
-# --- Обработчик кнопки "🔧 Управление базой данных" (админ) ---
+# --- Обработчик кнопки "🔧 Управление базой данных" (только для админов) ---
 @router.message(lambda message: message.text == "🔧 Управление базой данных")
 async def db_management_menu(message: types.Message):
     if message.from_user.id not in ADMIN_CHAT_IDS:
