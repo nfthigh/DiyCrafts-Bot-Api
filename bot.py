@@ -698,7 +698,7 @@ async def client_payment_payme(callback_query: types.CallbackQuery, state: FSMCo
     }
 
     try:
-        response = session.post(f"{WC_API_URL}/orders", json=orderData, timeout=30)
+        response = session.post(f"{WC_API_URL}/orders", json=orderData, timeout=400)
         wc_order = response.json()
         order_wc_id = wc_order.get("id")
         order_key = wc_order.get("order_key")
