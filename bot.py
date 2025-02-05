@@ -706,7 +706,7 @@ async def client_payment_payme(callback_query: types.CallbackQuery, state: FSMCo
             await callback_query.message.answer("🚫 Ошибка создания заказа в WooCommerce. Детали: " + json.dumps(wc_order))
             return
         # Формируем ссылку на авто-редирект через Flask-сервер
-        your_render_app_url = "https://your-render-app.onrender.com"  # Замените на URL вашего сервера
+        your_render_app_url = "https://diycrafts-bot-api.onrender.com"  # Замените на URL вашего сервера
         merchant_id = "6758399fd33fb8548cede2a7"  # Ваш мерчант ID
         callback_url = f"{WC_SITE_URL.rstrip('/')}/cart/?payme_success=1&order_id={order_id}"
         redirect_url = (
