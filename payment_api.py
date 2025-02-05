@@ -214,25 +214,8 @@ def complete():
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Получаем quantity: если отсутствует в запросе, берем из БД
-    quantity_str = request.form.get("quantity")
-    if quantity_str:
-        try:
-            quantity = int(quantity_str)
-        except Exception as e:
-            error_msg = f"Ошибка преобразования quantity: {e}"
-            app.logger.error(error_msg)
-            return jsonify({"error": "-8", "error_note": error_msg}), 400
-    else:
-        cursor.execute("SELECT quantity FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
-        row = cursor.fetchone()
-        if row and row[0]:
-            quantity = row[0]
-            app.logger.info("Количество (quantity) взято из БД: %s", quantity)
-        else:
-            error_msg = "Missing field: quantity and не удалось извлечь из БД"
-            app.logger.error(error_msg)
-            return jsonify({"error": "-8", "error_note": error_msg}), 400
+    # Для фискализации игнорируем значение quantity, устанавливаем его равным 1
+    fiscal_quantity = 1
 
     # Получаем название товара
     cursor.execute("SELECT product FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
@@ -243,8 +226,8 @@ def complete():
         product_name = "Неизвестный товар"
 
     app.logger.info(
-        "Параметры /complete: click_trans_id=%s, merchant_trans_id=%s, amount=%s, product_name=%s, quantity=%s, unit_price=%s",
-        click_trans_id, merchant_trans_id, amount, product_name, quantity, unit_price
+        "Параметры /complete: click_trans_id=%s, merchant_trans_id=%s, amount=%s, product_name=%s, fiscal_quantity=%s, unit_price=%s",
+        click_trans_id, merchant_trans_id, amount, product_name, fiscal_quantity, unit_price
     )
 
     cursor.execute("SELECT * FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
@@ -263,8 +246,8 @@ def complete():
     conn.commit()
 
     try:
-        # Формируем фискальный элемент, где GoodPrice = unit_price (тийины)
-        fiscal_item = create_fiscal_item(product_name, quantity, unit_price)
+        # Формируем фискальный элемент, где GoodPrice = unit_price и количество фиксировано (1)
+        fiscal_item = create_fiscal_item(product_name, fiscal_quantity, unit_price)
         fiscal_items = [fiscal_item]
         app.logger.info("Фискальные данные сформированы: %s", json.dumps(fiscal_items, indent=2, ensure_ascii=False))
     except Exception as e:

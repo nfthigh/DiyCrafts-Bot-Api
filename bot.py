@@ -48,7 +48,7 @@ GROUP_CHAT_ID = config.GROUP_CHAT_ID
 SELF_URL = config.SELF_URL  # URL для обращения к серверу
 
 # --- Функция формирования фискальных данных (интегрированная версия fiscal.py) ---
-# Здесь хранится информация о товарах; можно вынести в отдельный файл products.py или оставить здесь.
+# Информация о товарах можно хранить отдельно или здесь
 products_data = {
     "Кружка": {
         "SPIC": "06912001036000000",
@@ -102,7 +102,7 @@ def create_fiscal_item(product_name: str, quantity: int, unit_price: float) -> d
     Формирует элемент фискальных данных для платежа.
     
     :param product_name: Название товара (например, "Кружка")
-    :param quantity: Количество товара
+    :param quantity: Количество товара (для фискализации фиксируем 1, если цена не зависит от количества)
     :param unit_price: Цена за единицу (в тийинах)
     :return: Словарь с фискальными данными
     """
@@ -110,13 +110,12 @@ def create_fiscal_item(product_name: str, quantity: int, unit_price: float) -> d
     if not product:
         raise ValueError(f"Товар '{product_name}' не найден")
     price_total = unit_price * quantity
-    # Вычисляем НДС: предполагается, что ставка 12%
     vat = round((price_total / 1.12) * 0.12)
     fiscal_item = {
         "Name": product_name,
         "SPIC": product["SPIC"],
         "PackageCode": product["PackageCode"],
-        "GoodPrice": unit_price,  # Значение из базы (тийины)
+        "GoodPrice": unit_price,  # Используем значение из БД
         "Price": price_total,
         "Amount": quantity,
         "VAT": vat,
@@ -434,7 +433,7 @@ async def approve_order(callback_query: types.CallbackQuery, state: FSMContext):
     cursor.execute("UPDATE orders SET status='Ожидание цены' WHERE order_id=?", (order_id,))
     conn.commit()
     await state.update_data(order_id=order_id)
-    await callback_query.message.answer(f"Введите цену за единицу для заказа #{order_id} (в суммах):")
+    await callback_query.message.answer(f"Введите цену для заказа #{order_id} (в суммах):")
     await state.set_state(AdminPriceState.waiting_for_price)
 
 @router.message(AdminPriceState.waiting_for_price)
@@ -444,7 +443,7 @@ async def process_admin_price(message: types.Message, state: FSMContext):
         await message.reply("Цена должна быть числом.")
         return
     admin_price_sum = float(price_text)
-    # Вычисляем unit_price в тийинах
+    # Вычисляем unit_price в тийинах (администраторская цена — это фиксированная цена за заказ)
     unit_price = admin_price_sum * 100
     data = await state.get_data()
     order_id = data.get('order_id')
@@ -452,26 +451,19 @@ async def process_admin_price(message: types.Message, state: FSMContext):
         await message.reply("Ошибка: заказ не найден.")
         await state.clear()
         return
-    # Обновляем сразу два поля: admin_price (суммы) и unit_price (тийины)
+    # Обновляем поля: admin_price и unit_price
     cursor.execute("UPDATE orders SET admin_price=?, unit_price=? WHERE order_id=?", (admin_price_sum, unit_price, order_id))
     conn.commit()
     logger.info(f"Цена {admin_price_sum} сум и unit_price {unit_price} тийинов сохранены для заказа {order_id}.")
-    cursor.execute("SELECT user_id, product, quantity FROM orders WHERE order_id=?", (order_id,))
-    result = cursor.fetchone()
-    if not result:
-        await message.reply("Ошибка: заказ не найден.")
-        await state.clear()
-        return
-    client_id, product, quantity = result
-    total_amount_sum = admin_price_sum * quantity
+    # Здесь итоговая сумма равна фиксированной цене, независимо от введённого клиентом количества
+    total_amount_sum = admin_price_sum
     inline_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Согласен", callback_data=f"client_accept_order_{order_id}")],
         [InlineKeyboardButton(text="❌ Отменить заказ", callback_data=f"client_cancel_order_{order_id}")]
     ])
     await bot.send_message(
-        client_id,
-        f"Ваш заказ #{order_id} одобрен!\nЦена за единицу: {admin_price_sum} сум (GoodPrice = {unit_price} тийинов).\n"
-        f"Итоговая сумма: {total_amount_sum} сум.\nПодтверждаете заказ?",
+        cursor.execute("SELECT user_id FROM orders WHERE order_id=?", (order_id,)).fetchone()[0],
+        f"Ваш заказ #{order_id} одобрен!\nЦена: {admin_price_sum} сум.\nПодтверждаете заказ?",
         reply_markup=inline_kb
     )
     await message.reply("Цена отправлена клиенту на подтверждение.")
@@ -483,14 +475,15 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     order_id = int(callback_query.data.split('_')[-1])
     cursor.execute("UPDATE orders SET status='Ожидание оплаты' WHERE order_id=?", (order_id,))
     conn.commit()
-    cursor.execute("SELECT admin_price, product, quantity, user_id FROM orders WHERE order_id=?", (order_id,))
+    cursor.execute("SELECT admin_price, product, user_id FROM orders WHERE order_id=?", (order_id,))
     result = cursor.fetchone()
     if not result:
         await callback_query.message.answer("Ошибка: заказ не найден.")
         return
-    admin_price_sum, product, quantity, user_id = result
+    admin_price_sum, product, user_id = result
+    # Фиксируем unit_price как admin_price_sum * 100 и итоговую сумму равной admin_price_sum (игнорируем введённое клиентом количество)
     unit_price = admin_price_sum * 100
-    total_amount_sum = admin_price_sum * quantity
+    total_amount_sum = admin_price_sum
 
     # Генерируем уникальный merchant_trans_id (UUID)
     merchant_trans_id = str(uuid.uuid4())
@@ -504,7 +497,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     BASE_URL = f"{config.SELF_URL}/click-api"
     payload = {
         "merchant_trans_id": merchant_trans_id,
-        "amount": total_amount_sum,  # Сумма в суммах
+        "amount": total_amount_sum,  # сумма в суммах
         "phone_number": client_phone
     }
     logger.info("Отправляем запрос на создание инвойса с payload: %s", json.dumps(payload, indent=2))
@@ -525,8 +518,7 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
             [InlineKeyboardButton(text="💳 Оплатить", url=payment_url)]
         ])
         await callback_query.message.edit_text(
-            f"Заказ #{order_id} подтвержден.\nЦена за единицу: {admin_price_sum} сум (GoodPrice = {unit_price} тийинов).\n"
-            f"Итоговая сумма: {total_amount_sum} сум.\nНажмите кнопку ниже для оплаты.",
+            f"Заказ #{order_id} подтвержден.\nЦена: {admin_price_sum} сум.\nНажмите кнопку ниже для оплаты.",
             reply_markup=inline_kb
         )
     except Exception as e:
