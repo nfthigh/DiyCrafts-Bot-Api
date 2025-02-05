@@ -201,25 +201,30 @@ def complete():
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Извлекаем admin_price и unit_price из БД
-    cursor.execute("SELECT admin_price, unit_price FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
-    row = cursor.fetchone()
+    # Создаем новое соединение с базой данных для получения актуальных данных
+    new_conn = sqlite3.connect('clients.db')
+    new_cursor = new_conn.cursor()
+
+    # Извлекаем admin_price и unit_price из базы
+    new_cursor.execute("SELECT admin_price, unit_price FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
+    row = new_cursor.fetchone()
     app.logger.info("Данные заказа для unit_price: %s", row)
     if row and row[0] is not None and row[1] is not None:
         admin_price = float(row[0])
         unit_price = float(row[1])
         app.logger.info("unit_price взят из БД: admin_price=%s, unit_price=%s", admin_price, unit_price)
     else:
-        error_msg = "Цена заказа не установлена. Обратитесь к администратору или попробуйте позже."
+        error_msg = "Цена заказа не установлена. Пожалуйста, дождитесь подтверждения администратора."
         app.logger.error(error_msg)
+        new_conn.close()
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Для фискализации игнорируем значение quantity, устанавливаем его равным 1
+    # Для фискализации игнорируем значение количества, фиксируем его равным 1
     fiscal_quantity = 1
 
     # Получаем название товара
-    cursor.execute("SELECT product FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
-    row = cursor.fetchone()
+    new_cursor.execute("SELECT product FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
+    row = new_cursor.fetchone()
     if row and row[0]:
         product_name = row[0]
     else:
@@ -230,29 +235,32 @@ def complete():
         click_trans_id, merchant_trans_id, amount, product_name, fiscal_quantity, unit_price
     )
 
-    cursor.execute("SELECT * FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
-    order_row = cursor.fetchone()
+    new_cursor.execute("SELECT * FROM orders WHERE merchant_trans_id=?", (merchant_trans_id,))
+    order_row = new_cursor.fetchone()
     app.logger.info("Содержимое заказа: %s", order_row)
     if not order_row:
         error_msg = "Order not found"
         app.logger.error(error_msg)
+        new_conn.close()
         return jsonify({"error": "-5", "error_note": error_msg}), 404
     if order_row[-1] == 1:
         error_msg = "Already paid"
         app.logger.error(error_msg)
+        new_conn.close()
         return jsonify({"error": "-4", "error_note": error_msg}), 400
 
-    cursor.execute("UPDATE orders SET is_paid=1, status='processing' WHERE merchant_trans_id=?", (merchant_trans_id,))
-    conn.commit()
+    new_cursor.execute("UPDATE orders SET is_paid=1, status='processing' WHERE merchant_trans_id=?", (merchant_trans_id,))
+    new_conn.commit()
 
     try:
-        # Формируем фискальный элемент, где GoodPrice = unit_price и количество фиксировано (1)
+        # Формируем фискальный элемент, где GoodPrice = unit_price и количество фиксировано равным 1
         fiscal_item = create_fiscal_item(product_name, fiscal_quantity, unit_price)
         fiscal_items = [fiscal_item]
         app.logger.info("Фискальные данные сформированы: %s", json.dumps(fiscal_items, indent=2, ensure_ascii=False))
     except Exception as e:
         error_msg = f"Ошибка формирования фискальных данных: {e}"
         app.logger.error(error_msg)
+        new_conn.close()
         return jsonify({"error": "-10", "error_note": error_msg}), 400
 
     fiscal_headers = {
@@ -286,8 +294,9 @@ def complete():
         fiscal_result = {"error_code": -1, "error_note": str(e)}
         app.logger.error("Исключение при фискализации: %s", e)
 
-    cursor.execute("UPDATE orders SET status='completed' WHERE merchant_trans_id=?", (merchant_trans_id,))
-    conn.commit()
+    new_cursor.execute("UPDATE orders SET status='completed' WHERE merchant_trans_id=?", (merchant_trans_id,))
+    new_conn.commit()
+    new_conn.close()
 
     response = {
         "click_trans_id": click_trans_id,
