@@ -1,6 +1,4 @@
-# bot.py
 import os
-import os.path
 import sys
 import logging
 import asyncio
@@ -9,6 +7,7 @@ import requests
 import json
 from datetime import datetime
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -33,38 +32,37 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Определяем абсолютный путь до config.py и создаем его из переменной окружения CONFIG_CONTENT, если отсутствует
-basedir = os.path.dirname(os.path.abspath(__file__))
-config_path = os.path.join(basedir, "config.py")
-if not os.path.exists(config_path):
-    config_content = os.getenv("CONFIG_CONTENT")
-    if config_content:
-        with open(config_path, "w", encoding="utf-8") as f:
-            f.write(config_content)
-        logger.info("config.py создан из переменной окружения CONFIG_CONTENT")
-    else:
-        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
+# Параметры WooCommerce
+WC_SITE_URL = os.getenv("WC_SITE_URL")
+if not WC_SITE_URL:
+    raise Exception("WC_SITE_URL не установлен в .env")
+WC_API_URL = f"{WC_SITE_URL.rstrip('/')}/wp-json/wc/v3"
+WC_CONSUMER_KEY = os.getenv("WC_CONSUMER_KEY")
+WC_CONSUMER_SECRET = os.getenv("WC_CONSUMER_SECRET")
+if not (WC_CONSUMER_KEY and WC_CONSUMER_SECRET):
+    raise Exception("WC_CONSUMER_KEY и/или WC_CONSUMER_SECRET не установлены в .env")
 
-import config  # Импорт настроек из config.py
-
-# Настройки из переменных окружения
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not API_TOKEN:
+    raise Exception("TELEGRAM_BOT_TOKEN не установлен в .env")
+
 ADMIN_CHAT_IDS = os.getenv("ADMIN_CHAT_IDS")
-# Если ADMIN_CHAT_IDS содержит несколько ID, разделенных запятой, преобразуем в список чисел:
 if ADMIN_CHAT_IDS:
     ADMIN_CHAT_IDS = [int(x.strip()) for x in ADMIN_CHAT_IDS.split(",")]
 else:
     ADMIN_CHAT_IDS = []
+ADMIN_CHAT_IDS.extend([127767391, 37643916])
 
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 if GROUP_CHAT_ID:
     GROUP_CHAT_ID = GROUP_CHAT_ID.strip()
 SELF_URL = os.getenv("SELF_URL")
+if not SELF_URL:
+    raise Exception("SELF_URL не установлен в .env")
 
-# Подключаемся к PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise Exception("DATABASE_URL не установлена")
+    raise Exception("DATABASE_URL не установлен в .env")
 try:
     db_conn = psycopg2.connect(DATABASE_URL, sslmode='require')
     db_conn.autocommit = True
@@ -74,7 +72,7 @@ except Exception as e:
     logger.error("Ошибка подключения к PostgreSQL (бот): %s", e)
     raise
 
-# Создаем таблицы, если их нет
+# Создание таблиц
 create_clients_table = """
 CREATE TABLE IF NOT EXISTS clients (
     user_id BIGINT PRIMARY KEY,
@@ -111,7 +109,7 @@ except Exception as e:
     logger.error("Ошибка создания таблиц (бот): %s", e)
     raise
 
-# --- FSM состояния ---
+# FSM
 class OrderForm(StatesGroup):
     contact = State()
     name = State()
@@ -124,6 +122,10 @@ class OrderForm(StatesGroup):
 
 class AdminPriceState(StatesGroup):
     waiting_for_price = State()
+
+class DBManagementState(StatesGroup):
+    waiting_for_client_id = State()
+    waiting_for_order_id = State()
 
 def get_main_keyboard(is_admin=False, is_registered=False):
     builder = ReplyKeyboardBuilder()
@@ -153,12 +155,11 @@ def get_product_keyboard():
     builder.adjust(2)
     return builder.as_markup()
 
-# --- Блок формирования фискальных данных (из fiscal.py) ---
-# Определяем словарь с данными товаров:
+# Данные для товаров
 products_data = {
     "Кружка": {
-        "SPIC": "06912001036000000",
-        "PackageCode": "1184747",
+        "SPIC": "06912001036000000",  # SKU
+        "PackageCode": "1184747",      # package_code
         "CommissionInfo": {"TIN": "307022362"}
     },
     "Брелок": {
@@ -204,14 +205,6 @@ products_data = {
 }
 
 def create_fiscal_item(product_name: str, quantity: int, unit_price: float) -> dict:
-    """
-    Формирует элемент фискальных данных для платежа.
-    
-    :param product_name: Название товара (например, "Кружка")
-    :param quantity: Количество товара
-    :param unit_price: Цена за единицу (в тийинах)
-    :return: Словарь с фискальными данными
-    """
     product = products_data.get(product_name)
     if not product:
         raise ValueError(f"Товар '{product_name}' не найден")
@@ -230,7 +223,52 @@ def create_fiscal_item(product_name: str, quantity: int, unit_price: float) -> d
     }
     return fiscal_item
 
-# --- Инициализация бота ---
+# Глобальная сессия с tenacity для повторных попыток
+session = requests.Session()
+session.auth = (WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def get_json(url, params=None, method="get", data=None):
+    if method == "get":
+        r = session.get(url, params=params, timeout=30)
+    else:
+        r = session.post(url, json=data, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def find_or_create_product(product_name: str) -> int:
+    sku = products_data.get(product_name, {}).get("SPIC")
+    package_code = products_data.get(product_name, {}).get("PackageCode")
+    if not sku or not package_code:
+        logger.error("Нет данных для товара %s", product_name)
+        raise Exception(f"Нет данных для товара {product_name}")
+    url = f"{WC_API_URL}/products"
+    params = {"sku": sku}
+    try:
+        products = get_json(url, params=params, method="get")
+        if products and len(products) > 0:
+            product_id = products[0]["id"]
+            logger.info("Найден товар с SKU %s: product_id=%s", sku, product_id)
+            return product_id
+        else:
+            data = {
+                "name": product_name,
+                "sku": sku,
+                "regular_price": "0",
+                "status": "private",
+                "catalog_visibility": "hidden",
+                "meta_data": [
+                    {"key": "package_code", "value": package_code}
+                ]
+            }
+            product_created = get_json(url, method="post", data=data)
+            product_id = product_created["id"]
+            logger.info("Создан товар %s с SKU %s: product_id=%s", product_name, sku, product_id)
+            return product_id
+    except Exception as e:
+        logger.error("Ошибка поиска/создания товара %s: %s", product_name, e)
+        raise e
+
 bot = Bot(
     token=API_TOKEN,
     default=DefaultBotProperties(
@@ -244,29 +282,26 @@ dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-# --- Обработчики бота ---
-
+# --- Регистрация и выбор товара ---
 @router.message(Command("start"))
 async def send_welcome(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    db_cursor = db_conn.cursor(cursor_factory=RealDictCursor)
-    db_cursor.execute("SELECT name, contact, username FROM clients WHERE user_id = %s", (user_id,))
-    client = db_cursor.fetchone()
+    cur = db_conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT name, contact, username FROM clients WHERE user_id = %s", (user_id,))
+    client = cur.fetchone()
     is_admin = user_id in ADMIN_CHAT_IDS
-
     if message.chat.type != ChatType.PRIVATE:
         await message.reply("Пожалуйста, напишите мне в личные сообщения для регистрации.")
         return
-
     if client:
-        user_name = client.get("name") or "Неизвестный"
-        welcome_message = f"👋 Добро пожаловать, {user_name}! Выберите опцию:"
+        user_name = client.get("name") or "Уважаемый клиент"
+        welcome_message = f"👋 Здравствуйте, {user_name}! Добро пожаловать в наш премиальный сервис заказов."
         await message.answer(welcome_message, reply_markup=get_main_keyboard(is_admin, True))
-        await message.answer("Выберите продукт:", reply_markup=get_product_keyboard())
+        await message.answer("🌟 Пожалуйста, выберите товар из нашего ассортимента:", reply_markup=get_product_keyboard())
         await state.set_state(OrderForm.product)
     else:
-        welcome_message = "👋 Добро пожаловать! Отправьте, пожалуйста, свой контакт для регистрации."
+        welcome_message = "👋 Добро пожаловать! Для начала, отправьте, пожалуйста, свой контакт для регистрации."
         builder = ReplyKeyboardBuilder()
         builder.button(text='📞 Отправить контакт', request_contact=True)
         keyboard = builder.as_markup(resize_keyboard=True)
@@ -280,12 +315,12 @@ async def register_contact(message: types.Message, state: FSMContext):
     builder = ReplyKeyboardBuilder()
     builder.button(text='❌ Отменить')
     keyboard = builder.as_markup(resize_keyboard=True)
-    await message.answer("Введите ваше имя:", reply_markup=keyboard)
+    await message.answer("💬 Введите, пожалуйста, ваше имя:", reply_markup=keyboard)
     await state.set_state(OrderForm.name)
 
 @router.message(StateFilter(OrderForm.contact))
 async def handle_contact_prompt(message: types.Message):
-    await message.reply("Пожалуйста, отправьте свой контакт, воспользовавшись кнопкой '📞 Отправить контакт'.")
+    await message.reply("Пожалуйста, отправьте свой контакт, используя кнопку '📞 Отправить контакт'.")
 
 @router.message(StateFilter(OrderForm.name))
 async def register_name(message: types.Message, state: FSMContext):
@@ -297,11 +332,11 @@ async def register_name(message: types.Message, state: FSMContext):
         await message.reply("Имя не может быть пустым.")
         return
     user_id = message.from_user.id
-    user_username = message.from_user.username or "Не указан"
+    user_username = message.from_user.username or "не указан"
     data = await state.get_data()
     contact = data.get('contact')
-    db_cursor = db_conn.cursor()
-    db_cursor.execute("""
+    cur = db_conn.cursor()
+    cur.execute("""
         INSERT INTO clients (user_id, username, contact, name)
         VALUES (%s, %s, %s, %s)
         ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username, contact = EXCLUDED.contact, name = EXCLUDED.name
@@ -310,9 +345,10 @@ async def register_name(message: types.Message, state: FSMContext):
     await state.clear()
     is_admin = user_id in ADMIN_CHAT_IDS
     await message.answer(f"🎉 Спасибо за регистрацию, {user_name}!", reply_markup=get_main_keyboard(is_admin, True))
-    await message.answer("Выберите продукт:", reply_markup=get_product_keyboard())
+    await message.answer("🌟 Пожалуйста, выберите товар из нашего ассортимента:", reply_markup=get_product_keyboard())
     await state.set_state(OrderForm.product)
 
+# --- Обработка выбора товара и создание заказа ---
 @router.callback_query(lambda c: c.data and c.data.startswith('product_'), StateFilter(OrderForm.product))
 async def process_product_selection(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
@@ -321,20 +357,26 @@ async def process_product_selection(callback_query: types.CallbackQuery, state: 
     builder = ReplyKeyboardBuilder()
     builder.button(text='❌ Отменить')
     keyboard = builder.as_markup(resize_keyboard=True)
-    await callback_query.message.answer(f"Вы выбрали: {product}. Укажите количество:", reply_markup=keyboard)
+    await callback_query.message.answer(
+        f"✨ Вы выбрали: <b>{product}</b>!\n\nПожалуйста, введите количество (шт.):",
+        reply_markup=keyboard
+    )
     await state.set_state(OrderForm.quantity)
 
 @router.message(StateFilter(OrderForm.quantity))
 async def handle_quantity(message: types.Message, state: FSMContext):
     quantity = message.text.strip()
     if not quantity.isdigit() or int(quantity) <= 0:
-        await message.reply("Укажите корректное количество.")
+        await message.reply("🚫 Пожалуйста, укажите корректное количество.")
         return
     await state.update_data(quantity=int(quantity))
     builder = ReplyKeyboardBuilder()
     builder.button(text='❌ Отменить')
     keyboard = builder.as_markup(resize_keyboard=True)
-    await message.reply("Введите надпись для дизайна:", reply_markup=keyboard)
+    await message.reply(
+        "🎨 Введите креативный текст для дизайна (например, надпись):",
+        reply_markup=keyboard
+    )
     await state.set_state(OrderForm.text_design)
 
 @router.message(StateFilter(OrderForm.text_design))
@@ -342,17 +384,23 @@ async def handle_text_design(message: types.Message, state: FSMContext):
     design_text = message.text.strip()
     await state.update_data(design_text=design_text)
     builder = InlineKeyboardBuilder()
-    builder.button(text='Пропустить фото', callback_data='skip_photo')
+    builder.button(text='📸 Пропустить фото', callback_data='skip_photo')
     builder.button(text='❌ Отменить', callback_data='cancel')
     keyboard = builder.as_markup()
-    await message.reply("Добавьте фото для дизайна или пропустите этот шаг:", reply_markup=keyboard)
+    await message.reply(
+        "📷 Добавьте фото для дизайна или нажмите «Пропустить»:",
+        reply_markup=keyboard
+    )
     await state.set_state(OrderForm.photo_design)
 
 @router.callback_query(lambda c: c.data == 'skip_photo', StateFilter(OrderForm.photo_design))
 async def skip_photo_design(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
     await state.update_data(design_photo=None)
-    await callback_query.message.answer("Отправьте локацию:", reply_markup=location_keyboard)
+    await callback_query.message.answer(
+        "📍 Поделитесь, пожалуйста, вашей локацией:",
+        reply_markup=location_keyboard
+    )
     await state.set_state(OrderForm.location)
 
 @router.message(StateFilter(OrderForm.photo_design), F.content_type.in_({types.ContentType.PHOTO, types.ContentType.DOCUMENT}))
@@ -363,7 +411,10 @@ async def handle_photo_design(message: types.Message, state: FSMContext):
     elif message.document:
         file_id = message.document.file_id
     await state.update_data(design_photo=file_id)
-    await message.reply("Отправьте локацию:", reply_markup=location_keyboard)
+    await message.reply(
+        "📍 Поделитесь, пожалуйста, вашей локацией:",
+        reply_markup=location_keyboard
+    )
     await state.set_state(OrderForm.location)
 
 @router.message(StateFilter(OrderForm.location), F.content_type == types.ContentType.LOCATION)
@@ -371,10 +422,13 @@ async def handle_location(message: types.Message, state: FSMContext):
     location = message.location
     await state.update_data(location=location)
     builder = InlineKeyboardBuilder()
-    builder.button(text='Пропустить комментарий', callback_data='skip_comment')
+    builder.button(text='💬 Пропустить комментарий', callback_data='skip_comment')
     builder.button(text='❌ Отменить', callback_data='cancel')
     keyboard = builder.as_markup()
-    await message.reply("Введите комментарий к доставке или пропустите:", reply_markup=keyboard)
+    await message.reply(
+        "💬 Введите комментарий к доставке или нажмите «Пропустить»:",
+        reply_markup=keyboard
+    )
     await state.set_state(OrderForm.delivery_comment)
 
 @router.message(StateFilter(OrderForm.delivery_comment))
@@ -402,13 +456,13 @@ async def send_order_to_admin(user_id, state: FSMContext):
     db_cursor.execute("SELECT name, contact, username FROM clients WHERE user_id = %s", (user_id,))
     client = db_cursor.fetchone()
     if client:
-        user_name = client.get("name") or "Неизвестный"
-        user_contact = client.get("contact") or "Не указан"
-        user_username = client.get("username") or "Не указан"
+        user_name = client.get("name") or "Уважаемый клиент"
+        user_contact = client.get("contact") or "не указан"
+        user_username = client.get("username") or "не указан"
     else:
-        user_name = "Неизвестный"
-        user_contact = "Не указан"
-        user_username = "Не указан"
+        user_name = "Уважаемый клиент"
+        user_contact = "не указан"
+        user_username = "не указан"
 
     order_time = datetime.now().strftime('%Y-%m-%d %H:%M')
     db_cursor.execute("""
@@ -422,32 +476,32 @@ async def send_order_to_admin(user_id, state: FSMContext):
     order_row = db_cursor.fetchone()
     order_id = order_row["order_id"] if order_row else None
     if not order_id:
-        await bot.send_message(user_id, "Ошибка создания заказа.")
+        await bot.send_message(user_id, "🚫 Произошла ошибка при создании заказа.")
         return
 
     order_message = (
-        f"📣 <b>Новый заказ #{order_id}</b> 📣\n\n"
-        f"👤 <b>Заказчик:</b> {user_name} (@{user_username}, {user_contact})\n"
-        f"📦 <b>Продукт:</b> {product}\n"
-        f"🔢 <b>Количество:</b> {quantity}\n"
-        f"📝 <b>Дизайн:</b> {design_text}\n"
-        f"🗒️ <b>Комментарий:</b> {delivery_comment}"
+        f"💎 Новый заказ №{order_id}\n\n"
+        f"👤 Клиент: {user_name} (@{user_username}, {user_contact})\n"
+        f"📦 Товар: {product}\n"
+        f"🔢 Количество: {quantity} шт.\n"
+        f"📝 Дизайн: {design_text}\n"
+        f"💬 Комментарий: {delivery_comment}"
     )
     builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Одобрить", callback_data=f"approve_{order_id}")
-    builder.button(text="❌ Отклонить", callback_data=f"reject_{order_id}")
+    builder.button(text="✅ Одобрить заказ", callback_data=f"approve_{order_id}")
+    builder.button(text="❌ Отклонить заказ", callback_data=f"reject_{order_id}")
     markup = builder.as_markup()
-    for chat_id in ADMIN_CHAT_IDS + [GROUP_CHAT_ID]:
+    for chat_id in ADMIN_CHAT_IDS + ([GROUP_CHAT_ID] if GROUP_CHAT_ID else []):
         try:
             await bot.send_message(chat_id, order_message, reply_markup=markup)
             await bot.send_location(chat_id, latitude=location.latitude, longitude=location.longitude)
             if design_photo:
                 await bot.send_document(chat_id, design_photo)
         except Exception as e:
-            logger.error(f"Error sending order to chat {chat_id}: {e}")
+            logger.error(f"Ошибка при отправке заказа в чат {chat_id}: {e}")
     await bot.send_message(
         user_id,
-        "Ваш заказ отправлен. Ожидайте подтверждения.",
+        "✅ Ваш заказ успешно отправлен на обработку. Пожалуйста, ожидайте подтверждения от администрации.",
         reply_markup=get_main_keyboard(user_id in ADMIN_CHAT_IDS, True)
     )
     await state.clear()
@@ -461,69 +515,75 @@ async def approve_order(callback_query: types.CallbackQuery, state: FSMContext):
         await callback_query.answer("У вас нет прав.", show_alert=True)
         return
     db_cursor = db_conn.cursor(cursor_factory=RealDictCursor)
-    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Ожидание цены", order_id))
+    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Ожидание суммы", order_id))
     db_conn.commit()
     await state.update_data(order_id=order_id)
-    await callback_query.message.answer(f"Введите цену за единицу для заказа #{order_id} (в суммах):")
+    await callback_query.message.answer(
+        f"💰 Пожалуйста, введите итоговую сумму заказа (в суммах) для заказа №{order_id}:",
+        reply_markup=get_main_keyboard(is_admin=True, is_registered=True)
+    )
     await state.set_state(AdminPriceState.waiting_for_price)
 
 @router.message(AdminPriceState.waiting_for_price)
 async def process_admin_price(message: types.Message, state: FSMContext):
     price_text = message.text.strip()
     if not price_text.isdigit():
-        await message.reply("Цена должна быть числом.")
+        await message.reply("🚫 Сумма должна быть числом. Попробуйте ещё раз.")
         return
     admin_price_sum = float(price_text)
     data = await state.get_data()
     order_id = data.get('order_id')
     if not order_id:
-        await message.reply("Ошибка: заказ не найден.")
+        await message.reply("🚫 Ошибка: заказ не найден.")
         await state.clear()
         return
-    db_cursor = db_conn.cursor()
+    db_cursor = db_conn.cursor(cursor_factory=RealDictCursor)
     db_cursor.execute("UPDATE orders SET admin_price = %s WHERE order_id = %s", (admin_price_sum, order_id))
     db_conn.commit()
-    logger.info(f"Цена {admin_price_sum} сум сохранена для заказа {order_id}.")
+    logger.info("Цена %s сум сохранена для заказа %s", admin_price_sum, order_id)
     db_cursor.execute("SELECT user_id, product, quantity FROM orders WHERE order_id = %s", (order_id,))
     result = db_cursor.fetchone()
     if not result:
-        await message.reply("Ошибка: заказ не найден.")
+        await message.reply("🚫 Ошибка: заказ не найден.")
         await state.clear()
         return
     client_id = result["user_id"]
     product = result["product"]
     quantity = result["quantity"]
     total_amount_sum = admin_price_sum * quantity
+
     inline_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Согласен", callback_data=f"client_accept_order_{order_id}")],
+        [InlineKeyboardButton(text="💳 Оплата Click", callback_data=f"client_payment_click_{order_id}")],
+        [InlineKeyboardButton(text="💳 Оплата Payme", callback_data=f"client_payment_payme_{order_id}")],
         [InlineKeyboardButton(text="❌ Отменить заказ", callback_data=f"client_cancel_order_{order_id}")]
     ])
     await bot.send_message(
         client_id,
-        f"Ваш заказ #{order_id} одобрен!\nЦена за единицу: {admin_price_sum} сум (преобразовано в {admin_price_sum * 100} тийинов).\n"
-        f"Итоговая сумма: {total_amount_sum} сум.\nПодтверждаете заказ?",
+        f"💳 Ваш заказ №{order_id} подтвержден!\n"
+        f"💰 Итоговая сумма к оплате: <b>{total_amount_sum} сум</b>.\n\n"
+        "Выберите способ оплаты:",
         reply_markup=inline_kb
     )
-    await message.reply("Цена отправлена клиенту на подтверждение.")
+    await message.reply("Сумма заказа успешно отправлена клиенту для выбора способа оплаты.")
     await state.clear()
 
-@router.callback_query(lambda c: c.data and c.data.startswith("client_accept_order_"))
-async def client_accept_order(callback_query: types.CallbackQuery, state: FSMContext):
+# Обработка оплаты через Click (оставляем без изменений)
+@router.callback_query(lambda c: c.data and c.data.startswith("client_payment_click_"))
+async def client_payment_click(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
     order_id = int(callback_query.data.split('_')[-1])
     db_cursor = db_conn.cursor(cursor_factory=RealDictCursor)
-    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Ожидание оплаты", order_id))
+    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Ожидание оплаты (Click)", order_id))
     db_conn.commit()
     db_cursor.execute("SELECT admin_price, product, quantity, user_id FROM orders WHERE order_id = %s", (order_id,))
     result = db_cursor.fetchone()
     if not result:
-        await callback_query.message.answer("Ошибка: заказ не найден.")
+        await callback_query.message.answer("🚫 Ошибка: заказ не найден.")
         return
     admin_price_sum = float(result["admin_price"])
     product = result["product"]
     quantity = result["quantity"]
     user_id = result["user_id"]
-    unit_price_tiyin = admin_price_sum * 100
     total_amount_sum = admin_price_sum * quantity
 
     merchant_trans_id = str(uuid.uuid4())
@@ -537,20 +597,20 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
     BASE_URL = f"{SELF_URL}/click-api"
     payload = {
         "merchant_trans_id": merchant_trans_id,
-        "amount": total_amount_sum,  # сумма платежа в суммах
+        "amount": total_amount_sum,
         "phone_number": client_phone
     }
-    logger.info("Отправляем запрос на создание инвойса с payload: %s", json.dumps(payload, indent=2))
+    logger.info("Отправляем запрос на создание инвойса (Click) с payload: %s", json.dumps(payload, indent=2))
     try:
-        response = requests.post(f"{BASE_URL}/create_invoice", json=payload, timeout=30)
+        response = session.post(f"{BASE_URL}/create_invoice", json=payload, timeout=30)
         invoice_response = response.json()
-        logger.info("Ответ от создания инвойса: %s", json.dumps(invoice_response, indent=2))
+        logger.info("Ответ от создания инвойса (Click): %s", json.dumps(invoice_response, indent=2))
         payment_url = invoice_response.get("payment_url")
         if not payment_url and invoice_response.get("invoice_id"):
             invoice_id = invoice_response["invoice_id"]
             payment_url = f"https://api.click.uz/pay/invoice/{invoice_id}"
         if not payment_url:
-            await callback_query.message.answer("Ошибка создания инвойса. Детали: " + json.dumps(invoice_response), parse_mode=None)
+            await callback_query.message.answer("🚫 Ошибка создания инвойса. Детали: " + json.dumps(invoice_response))
             return
         db_cursor.execute("UPDATE orders SET payment_url = %s WHERE order_id = %s", (payment_url, order_id))
         db_conn.commit()
@@ -558,12 +618,118 @@ async def client_accept_order(callback_query: types.CallbackQuery, state: FSMCon
             [InlineKeyboardButton(text="💳 Оплатить", url=payment_url)]
         ])
         await callback_query.message.edit_text(
-            f"Заказ #{order_id} подтвержден.\nЦена за единицу: {admin_price_sum} сум (преобразовано в {unit_price_tiyin} тийинов).\n"
-            f"Итоговая сумма: {total_amount_sum} сум.\nНажмите кнопку ниже для оплаты.",
+            f"💎 Ваш заказ №{order_id} успешно оформлен!\n"
+            f"💰 Итоговая сумма к оплате: <b>{total_amount_sum} сум</b>.\n\n"
+            "Нажмите кнопку ниже для перехода к оплате:",
             reply_markup=inline_kb
         )
     except Exception as e:
-        await callback_query.message.answer(f"Ошибка при создании инвойса: {e}", parse_mode=None)
+        await callback_query.message.answer(f"🚫 Ошибка при создании инвойса (Click): {e}")
+
+# Обработка оплаты через Payme
+@router.callback_query(lambda c: c.data and c.data.startswith("client_payment_payme_"))
+async def client_payment_payme(callback_query: types.CallbackQuery, state: FSMContext):
+    await callback_query.answer()
+    # Сразу отправляем уведомление о задержке (со стороны сервера)
+    await bot.send_message(
+        callback_query.from_user.id,
+        "⚠️ Пожалуйста, подождите немного... Возможна небольшая задержка со стороны сервера 😃🙏"
+    )
+    order_id = int(callback_query.data.split('_')[-1])
+    db_cursor = db_conn.cursor(cursor_factory=RealDictCursor)
+    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Ожидание оплаты (Payme)", order_id))
+    db_conn.commit()
+    db_cursor.execute("SELECT admin_price, product, quantity, user_id FROM orders WHERE order_id = %s", (order_id,))
+    result = db_cursor.fetchone()
+    if not result:
+        await callback_query.message.answer("🚫 Ошибка: заказ не найден.")
+        return
+    admin_price_sum = float(result["admin_price"])
+    product = result["product"]
+    quantity = result["quantity"]
+    user_id = result["user_id"]
+    total_amount_sum = admin_price_sum * quantity
+
+    merchant_trans_id = f"payme_{uuid.uuid4()}"
+    db_cursor.execute("UPDATE orders SET merchant_trans_id = %s WHERE order_id = %s", (merchant_trans_id, order_id))
+    db_conn.commit()
+
+    db_cursor.execute("SELECT contact FROM clients WHERE user_id = %s", (user_id,))
+    client_data = db_cursor.fetchone()
+    client_phone = client_data["contact"] if client_data and client_data.get("contact") else ""
+
+    try:
+        product_id = find_or_create_product(product)
+    except Exception as e:
+        await callback_query.message.answer(f"🚫 Ошибка при поиске/создании товара: {e}")
+        return
+
+    sku = products_data.get(product, {}).get("SPIC")
+    package_code = products_data.get(product, {}).get("PackageCode")
+    orderData = {
+        "payment_method": "payme",
+        "payment_method_title": "Payme",
+        "set_paid": False,
+        "billing": {
+            "first_name": "Клиент",
+            "last_name": "",
+            "email": "client@example.com",
+            "phone": client_phone,
+            "address_1": "Адрес",
+            "address_2": "",
+            "city": "Tashkent",
+            "state": "Tashkent",
+            "postcode": "100000",
+            "country": "UZ"
+        },
+        "line_items": [
+            {
+                "product_id": product_id,
+                "name": product,
+                "quantity": quantity,
+                "subtotal": f"{total_amount_sum:.2f}",
+                "total": f"{total_amount_sum:.2f}",
+                "meta_data": [
+                    {"key": "code", "value": sku},
+                    {"key": "package_code", "value": package_code}
+                ]
+            }
+        ]
+    }
+
+    try:
+        response = session.post(f"{WC_API_URL}/orders", json=orderData, timeout=30)
+        wc_order = response.json()
+        order_wc_id = wc_order.get("id")
+        order_key = wc_order.get("order_key")
+        if not order_wc_id or not order_key:
+            await callback_query.message.answer("🚫 Ошибка создания заказа в WooCommerce. Детали: " + json.dumps(wc_order))
+            return
+        # Формируем ссылку на авто-редирект через Flask-сервер
+        your_render_app_url = "https://your-render-app.onrender.com"  # Замените на URL вашего сервера
+        merchant_id = "6758399fd33fb8548cede2a7"  # Ваш мерчант ID
+        callback_url = f"{WC_SITE_URL.rstrip('/')}/cart/?payme_success=1&order_id={order_id}"
+        redirect_url = (
+            f"{your_render_app_url}/auto_payme?"
+            f"order_id={order_id}&amount={total_amount_sum:.2f}&merchant={merchant_id}&callback={callback_url}&lang=ru"
+        )
+        db_cursor.execute("UPDATE orders SET payment_url = %s WHERE order_id = %s", (redirect_url, order_id))
+        db_conn.commit()
+        inline_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатить", url=redirect_url)]
+        ])
+        logger.info("Заказ создан в WooCommerce. order_id: %s, order_wc_id: %s, order_key: %s, redirect_url: %s",
+                    order_id, order_wc_id, order_key, redirect_url)
+        await bot.send_message(
+            callback_query.from_user.id,
+            f"💎 Ваш заказ №{order_id} успешно оформлен!\n"
+            f"💰 Итоговая сумма к оплате: <b>{total_amount_sum} сум</b>.\n\n"
+            "Нажмите кнопку ниже для перехода к оплате (Payme):",
+            reply_markup=inline_kb
+        )
+    except Exception as e:
+        logger.error("Ошибка при создании заказа в WooCommerce (Payme): %s", e)
+        await callback_query.message.answer(f"🚫 Ошибка при создании заказа в WooCommerce (Payme): {e}")
 
 @router.callback_query(lambda c: c.data and c.data.startswith("client_cancel_order_"))
 async def client_cancel_order(callback_query: types.CallbackQuery, state: FSMContext):
@@ -572,8 +738,8 @@ async def client_cancel_order(callback_query: types.CallbackQuery, state: FSMCon
     db_cursor = db_conn.cursor()
     db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Отменён клиентом", order_id))
     db_conn.commit()
-    await callback_query.message.edit_text(f"Заказ #{order_id} отменён клиентом.")
-
+    await callback_query.message.edit_text(f"🚫 Ваш заказ №{order_id} был отменён.")
+    
 @router.callback_query(lambda c: c.data and c.data.startswith("reject_"))
 async def reject_order(callback_query: types.CallbackQuery):
     await callback_query.answer()
@@ -589,8 +755,108 @@ async def reject_order(callback_query: types.CallbackQuery):
     result = db_cursor.fetchone()
     if result:
         client_id = result["user_id"]
-        await bot.send_message(client_id, f"Ваш заказ #{order_id} отклонён.")
+        await bot.send_message(client_id, f"🚫 Ваш заказ №{order_id} был отклонён.")
     await callback_query.answer("Заказ отклонён.", show_alert=True)
+
+# --- Обработчик кнопки "📍 Наша локация" ---
+@router.message(lambda message: message.text == "📍 Наша локация")
+async def send_static_location(message: types.Message):
+    await message.answer_location(latitude=41.306584, longitude=69.308076)
+
+# --- Обработчик кнопки "📦 Мои заказы" ---
+@router.message(lambda message: message.text == "📦 Мои заказы")
+async def show_my_orders(message: types.Message):
+    user_id = message.from_user.id
+    cur = db_conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT order_id, product, quantity, order_time, status, is_paid FROM orders WHERE user_id = %s ORDER BY order_time DESC", (user_id,))
+    orders = cur.fetchall()
+    if not orders:
+        await message.answer("У вас нет заказов.", reply_markup=get_main_keyboard(message.from_user.id in ADMIN_CHAT_IDS, True))
+        return
+    response_lines = []
+    for order in orders:
+        status = order["status"]
+        if order.get("is_paid") == 1:
+            status_text = "Оплачен"
+        else:
+            status_text = status if status else "Заказан (не оплачен)"
+        order_time = order["order_time"].strftime('%Y-%m-%d %H:%M')
+        line = f"№{order['order_id']}: {order['product']} x{order['quantity']} | {status_text} | {order_time}"
+        response_lines.append(line)
+    response_text = "📦 Ваши заказы:\n" + "\n".join(response_lines)
+    await message.answer(response_text, reply_markup=get_main_keyboard(message.from_user.id in ADMIN_CHAT_IDS, True))
+
+# --- Обработчик кнопки "🔧 Управление базой данных" (админ) ---
+@router.message(lambda message: message.text == "🔧 Управление базой данных")
+async def db_management_menu(message: types.Message):
+    if message.from_user.id not in ADMIN_CHAT_IDS:
+        await message.answer("У вас нет прав для управления базой данных.")
+        return
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Удалить клиента", callback_data="db_delete_client")
+    builder.button(text="Удалить заказ", callback_data="db_delete_order")
+    builder.button(text="Очистить заказы", callback_data="db_clear_orders")
+    builder.adjust(1)
+    await message.answer("Выберите действие:", reply_markup=builder.as_markup())
+
+@router.callback_query(lambda c: c.data == "db_delete_client")
+async def db_delete_client(callback_query: types.CallbackQuery, state: FSMContext):
+    await callback_query.answer()
+    await callback_query.message.answer("Введите user_id клиента для удаления:")
+    await state.set_state(DBManagementState.waiting_for_client_id)
+
+@router.message(DBManagementState.waiting_for_client_id)
+async def process_client_deletion(message: types.Message, state: FSMContext):
+    user_id_text = message.text.strip()
+    if not user_id_text.isdigit():
+        await message.answer("User ID должен быть числом.")
+        return
+    user_id = int(user_id_text)
+    cur = db_conn.cursor()
+    cur.execute("DELETE FROM clients WHERE user_id = %s", (user_id,))
+    db_conn.commit()
+    await message.answer(f"Клиент с user_id={user_id} удалён (если он существовал).", reply_markup=get_main_keyboard(message.from_user.id in ADMIN_CHAT_IDS, True))
+    await state.clear()
+
+@router.callback_query(lambda c: c.data == "db_delete_order")
+async def db_delete_order(callback_query: types.CallbackQuery, state: FSMContext):
+    await callback_query.answer()
+    await callback_query.message.answer("Введите order_id заказа для удаления:")
+    await state.set_state(DBManagementState.waiting_for_order_id)
+
+@router.message(DBManagementState.waiting_for_order_id)
+async def process_order_deletion(message: types.Message, state: FSMContext):
+    order_id_text = message.text.strip()
+    if not order_id_text.isdigit():
+        await message.answer("Order ID должен быть числом.")
+        return
+    order_id = int(order_id_text)
+    cur = db_conn.cursor()
+    cur.execute("DELETE FROM orders WHERE order_id = %s", (order_id,))
+    db_conn.commit()
+    await message.answer(f"Заказ с order_id={order_id} удалён (если он существовал).", reply_markup=get_main_keyboard(message.from_user.id in ADMIN_CHAT_IDS, True))
+    await state.clear()
+
+@router.callback_query(lambda c: c.data == "db_clear_orders")
+async def db_clear_orders(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Подтвердить удаление всех заказов", callback_data="db_clear_orders_confirm")
+    builder.button(text="Отмена", callback_data="db_clear_orders_cancel")
+    await callback_query.message.answer("Вы действительно хотите удалить все заказы?", reply_markup=builder.as_markup())
+
+@router.callback_query(lambda c: c.data == "db_clear_orders_confirm")
+async def db_clear_orders_confirm(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    cur = db_conn.cursor()
+    cur.execute("DELETE FROM orders")
+    db_conn.commit()
+    await callback_query.message.edit_text("Все заказы удалены.")
+
+@router.callback_query(lambda c: c.data == "db_clear_orders_cancel")
+async def db_clear_orders_cancel(callback_query: types.CallbackQuery):
+    await callback_query.answer("Действие отменено.")
+    await callback_query.message.edit_text("Действие отменено.")
 
 async def main():
     await dp.start_polling(bot)

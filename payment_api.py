@@ -1,4 +1,3 @@
-# payment_api.py
 import os
 import sys
 import logging
@@ -9,14 +8,13 @@ import requests
 import threading
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from dotenv import load_dotenv
 from fiscal import create_fiscal_item  # Функция формирования фискальных данных
 
 # Загружаем переменные окружения из .env
 load_dotenv()
 
-# Настроим логирование в консоль (stdout)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -124,7 +122,7 @@ def create_invoice():
     }
     payload = {
         "service_id": SERVICE_ID,
-        "amount": amount,  # сумма платежа в суммах
+        "amount": amount,
         "phone_number": phone_number,
         "merchant_trans_id": merchant_trans_id
     }
@@ -201,20 +199,18 @@ def complete():
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Извлекаем unit_price из БД (admin_price вводится администратором в суммах)
     cursor.execute("SELECT admin_price FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
     row = cursor.fetchone()
     app.logger.info("Данные заказа для unit_price: %s", row)
     if row and row.get("admin_price"):
         admin_price = float(row["admin_price"])
         unit_price = admin_price * 100  # переводим в тийины
-        app.logger.info("unit_price взят из БД: admin_price=%s, unit_price=%s", admin_price, unit_price)
+        app.logger.info("unit_price из БД: admin_price=%s, unit_price=%s", admin_price, unit_price)
     else:
         error_msg = "Missing field: unit_price and не удалось извлечь из БД"
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Извлекаем quantity; если не передано, берем из БД
     quantity_str = request.form.get("quantity")
     if quantity_str:
         try:
@@ -228,13 +224,12 @@ def complete():
         row = cursor.fetchone()
         if row and row.get("quantity"):
             quantity = int(row["quantity"])
-            app.logger.info("Количество (quantity) взято из БД: %s", quantity)
+            app.logger.info("Количество (quantity) из БД: %s", quantity)
         else:
             error_msg = "Missing field: quantity and не удалось извлечь из БД"
             app.logger.error(error_msg)
             return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Извлекаем название товара из заказа (из поля product)
     cursor.execute("SELECT product FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
     row = cursor.fetchone()
     if row and row.get("product"):
@@ -282,7 +277,7 @@ def complete():
         "service_id": SERVICE_ID,
         "payment_id": click_trans_id,
         "items": fiscal_items,
-        "received_ecash": amount,  # сумма платежа в суммах
+        "received_ecash": amount,
         "received_cash": 0,
         "received_card": 0
     }
@@ -316,6 +311,61 @@ def complete():
     }
     app.logger.info("Ответ /complete отправлен: %s", json.dumps(response, indent=2, ensure_ascii=False))
     return jsonify(response)
+
+# Новый endpoint для автоматического сабмита формы Payme
+@app.route("/auto_payme", methods=["GET"])
+def auto_payme_redirect():
+    order_id = request.args.get("order_id", "")
+    amount = request.args.get("amount", "")
+    merchant = request.args.get("merchant", "")
+    callback_url = request.args.get("callback", "")
+    lang = request.args.get("lang", "ru")
+    description = f"Оплата заказа №{order_id}"
+    
+    html_template = """
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+      <meta charset="UTF-8">
+      <title>Перенаправление на оплату</title>
+      <script>
+        window.onload = function() {
+          document.getElementById('payme_form').submit();
+        };
+      </script>
+      <style>
+        body {
+          font-family: Arial, sans-serif;
+          text-align: center;
+          margin-top: 50px;
+          color: #333;
+        }
+      </style>
+    </head>
+    <body>
+      <h2>Пожалуйста, подождите...</h2>
+      <p>Мы автоматически перенаправляем вас на страницу оплаты. Это может занять несколько секунд 😊🙏</p>
+      <form action="https://checkout.paycom.uz" method="POST" id="payme_form">
+        <input type="hidden" name="account[order_id]" value="{{ order_id }}">
+        <input type="hidden" name="amount" value="{{ amount }}">
+        <input type="hidden" name="merchant" value="{{ merchant }}">
+        <input type="hidden" name="callback" value="{{ callback_url }}">
+        <input type="hidden" name="lang" value="{{ lang }}">
+        <input type="hidden" name="description" value="{{ description }}">
+        <noscript>
+          <input type="submit" value="Оплатить">
+        </noscript>
+      </form>
+    </body>
+    </html>
+    """
+    return render_template_string(html_template,
+                                  order_id=order_id,
+                                  amount=amount,
+                                  merchant=merchant,
+                                  callback_url=callback_url,
+                                  lang=lang,
+                                  description=description)
 
 def auto_ping():
     """
