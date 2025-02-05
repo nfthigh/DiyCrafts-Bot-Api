@@ -347,7 +347,7 @@ async def register_name(message: types.Message, state: FSMContext):
     await state.clear()
     is_admin = user_id in ADMIN_CHAT_IDS
     await message.answer(f"🎉 Спасибо за регистрацию, {user_name}!", reply_markup=get_main_keyboard(is_admin, True))
-    await message.answer("🌟 Пожалуйста, выберите товар из нашего асс assortimента:", reply_markup=get_product_keyboard())
+    await message.answer("🌟 Пожалуйста, выберите товар из нашего ассортимента:", reply_markup=get_product_keyboard())
     await state.set_state(OrderForm.product)
 
 # --- Обработка выбора товара и создание заказа ---
@@ -627,10 +627,12 @@ async def client_payment_click(callback_query: types.CallbackQuery, state: FSMCo
     except Exception as e:
         await callback_query.message.answer(f"🚫 Ошибка при создании инвойса (Click): {e}")
 
-# Обработка оплаты через Payme
+# Обработка оплаты через Payme с использованием поля items и указанием total
 @router.callback_query(lambda c: c.data and c.data.startswith("client_payment_payme_"))
 async def client_payment_payme(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
+    
+    # Получаем данные заказа из нашей базы
     order_id = int(callback_query.data.split('_')[-1])
     db_cursor = db_conn.cursor(cursor_factory=RealDictCursor)
     db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Ожидание оплаты (Payme)", order_id))
@@ -644,8 +646,14 @@ async def client_payment_payme(callback_query: types.CallbackQuery, state: FSMCo
     product = result["product"]
     quantity = result["quantity"]
     user_id = result["user_id"]
+    
+    # Общая сумма заказа (в сумах)
     total_amount_sum = admin_price_sum * quantity
 
+    # В поле "price" передаем общую сумму заказа, переведенную в тийины:
+    # Если админ ввёл 1000 сум и количество 1, то 1000 * 1 * 100 = 100000 тийин
+    total_price_tiyin = int(total_amount_sum * 100)
+    
     merchant_trans_id = f"payme_{uuid.uuid4()}"
     db_cursor.execute("UPDATE orders SET merchant_trans_id = %s WHERE order_id = %s", (merchant_trans_id, order_id))
     db_conn.commit()
@@ -653,6 +661,12 @@ async def client_payment_payme(callback_query: types.CallbackQuery, state: FSMCo
     db_cursor.execute("SELECT contact FROM clients WHERE user_id = %s", (user_id,))
     client_data = db_cursor.fetchone()
     client_phone = client_data["contact"] if client_data and client_data.get("contact") else ""
+
+    # Отправляем уведомление о задержке (со стороны сервера)
+    await bot.send_message(
+        callback_query.from_user.id,
+        "⚠️ Пожалуйста, подождите немного... Возможна небольшая задержка со стороны сервера 😃🙏"
+    )
 
     # Поиск или создание товара в WooCommerce
     try:
@@ -663,6 +677,8 @@ async def client_payment_payme(callback_query: types.CallbackQuery, state: FSMCo
 
     sku = products_data.get(product, {}).get("SPIC")
     package_code = products_data.get(product, {}).get("PackageCode")
+    
+    # Формируем объект заказа с использованием ключа "items" и указываем "total" и "price"
     orderData = {
         "payment_method": "payme",
         "payment_method_title": "Payme",
@@ -679,17 +695,19 @@ async def client_payment_payme(callback_query: types.CallbackQuery, state: FSMCo
             "postcode": "100000",
             "country": "UZ"
         },
-        "line_items": [
+        # Общая сумма заказа (в сумах)
+        "total": f"{total_amount_sum:.2f}",
+        "items": [
             {
-                "product_id": product_id,
-                "name": product,
-                "quantity": quantity,
-                "subtotal": f"{total_amount_sum:.2f}",
-                "total": f"{total_amount_sum:.2f}",
-                "meta_data": [
-                    {"key": "code", "value": sku},
-                    {"key": "package_code", "value": package_code}
-                ]
+                "discount": 0,
+                "title": product,
+                # В поле "price" передается общая сумма заказа в тийинах
+                "price": total_price_tiyin,
+                "count": quantity,
+                "code": sku,
+                "units": 796,
+                "vat_percent": 0,
+                "package_code": package_code
             }
         ]
     }
@@ -702,6 +720,12 @@ async def client_payment_payme(callback_query: types.CallbackQuery, state: FSMCo
         if not order_wc_id or not order_key:
             await callback_query.message.answer("🚫 Ошибка создания заказа в WooCommerce. Детали: " + json.dumps(wc_order))
             return
+
+        # Обновляем статус заказа, чтобы он был доступен для оплаты
+        update_data = {"status": "pending"}
+        update_response = session.put(f"{WC_API_URL}/orders/{order_wc_id}", json=update_data, timeout=30)
+        logger.info("Order status update response: %s", update_response.text)
+
         payUrl = f"{WC_SITE_URL.rstrip('/')}/checkout/order-pay/{order_wc_id}/?key={order_key}&order_pay={order_wc_id}"
         db_cursor.execute("UPDATE orders SET payment_url = %s WHERE order_id = %s", (payUrl, order_id))
         db_conn.commit()
@@ -710,12 +734,7 @@ async def client_payment_payme(callback_query: types.CallbackQuery, state: FSMCo
         ])
         logger.info("Заказ создан в WooCommerce. order_id: %s, order_wc_id: %s, order_key: %s, payUrl: %s",
                     order_id, order_wc_id, order_key, payUrl)
-        # Отправляем дополнительное сообщение с дружелюбным уведомлением о задержке
-        await bot.send_message(
-            callback_query.from_user.id,
-            "⚠️ Пожалуйста, подождите немного... Возможна небольшая задержка с нашей стороны 😃🙏",
-        )
-        # Отправляем новое сообщение с кнопкой для оплаты
+        # Отправляем сообщение с кнопкой для оплаты
         await bot.send_message(
             callback_query.from_user.id,
             f"💎 Ваш заказ №{order_id} успешно оформлен!\n"
