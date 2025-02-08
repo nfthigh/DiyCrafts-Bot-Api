@@ -1,4 +1,5 @@
 import os
+import os.path
 import sys
 import logging
 import asyncio
@@ -7,7 +8,6 @@ import requests
 import json
 from datetime import datetime
 from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -32,37 +32,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Получаем параметры WooCommerce из .env
-WC_SITE_URL = os.getenv("WC_SITE_URL")
-if not WC_SITE_URL:
-    raise Exception("WC_SITE_URL не установлен в .env")
-WC_API_URL = f"{WC_SITE_URL.rstrip('/')}/wp-json/wc/v3"
-WC_CONSUMER_KEY = os.getenv("WC_CONSUMER_KEY")
-WC_CONSUMER_SECRET = os.getenv("WC_CONSUMER_SECRET")
-if not (WC_CONSUMER_KEY and WC_CONSUMER_SECRET):
-    raise Exception("WC_CONSUMER_KEY и/или WC_CONSUMER_SECRET не установлены в .env")
+basedir = os.path.dirname(os.path.abspath(__file__))
+config_path = os.path.join(basedir, "config.py")
+if not os.path.exists(config_path):
+    config_content = os.getenv("CONFIG_CONTENT")
+    if config_content:
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(config_content)
+        logger.info("config.py создан из переменной окружения CONFIG_CONTENT")
+    else:
+        raise Exception("Переменная окружения CONFIG_CONTENT не установлена.")
+
+import config  # Импорт настроек из config.py
 
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not API_TOKEN:
-    raise Exception("TELEGRAM_BOT_TOKEN не установлен в .env")
-
 ADMIN_CHAT_IDS = os.getenv("ADMIN_CHAT_IDS")
 if ADMIN_CHAT_IDS:
     ADMIN_CHAT_IDS = [int(x.strip()) for x in ADMIN_CHAT_IDS.split(",")]
 else:
     ADMIN_CHAT_IDS = []
+# Добавляем дополнительных администраторов
 ADMIN_CHAT_IDS.extend([127767391, 37643916])
 
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 if GROUP_CHAT_ID:
     GROUP_CHAT_ID = GROUP_CHAT_ID.strip()
 SELF_URL = os.getenv("SELF_URL")
-if not SELF_URL:
-    raise Exception("SELF_URL не установлен в .env")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise Exception("DATABASE_URL не установлен в .env")
+    raise Exception("DATABASE_URL не установлена")
 try:
     db_conn = psycopg2.connect(DATABASE_URL, sslmode='require')
     db_conn.autocommit = True
@@ -72,7 +71,6 @@ except Exception as e:
     logger.error("Ошибка подключения к PostgreSQL (бот): %s", e)
     raise
 
-# Создание таблиц, если их нет
 create_clients_table = """
 CREATE TABLE IF NOT EXISTS clients (
     user_id BIGINT PRIMARY KEY,
@@ -109,7 +107,7 @@ except Exception as e:
     logger.error("Ошибка создания таблиц (бот): %s", e)
     raise
 
-# Определяем FSM для заказа
+# FSM для заказа товара
 class OrderForm(StatesGroup):
     contact = State()
     name = State()
@@ -120,14 +118,19 @@ class OrderForm(StatesGroup):
     location = State()
     delivery_comment = State()
 
+# FSM для ввода суммы администратором
 class AdminPriceState(StatesGroup):
     waiting_for_price = State()
 
+# FSM для управления базой данных (админ)
 class DBManagementState(StatesGroup):
     waiting_for_client_id = State()
     waiting_for_order_id = State()
 
 def get_main_keyboard(is_admin=False, is_registered=False):
+    """
+    Формирует основную клавиатуру.
+    """
     builder = ReplyKeyboardBuilder()
     builder.button(text='🔄 Начать сначала')
     builder.button(text='📍 Наша локация')
@@ -155,11 +158,11 @@ def get_product_keyboard():
     builder.adjust(2)
     return builder.as_markup()
 
-# Пример данных для товаров (фискальные данные)
+# --- Фискальные данные ---
 products_data = {
     "Кружка": {
-        "SPIC": "06912001036000000",  # SKU
-        "PackageCode": "1184747",      # package_code
+        "SPIC": "06912001036000000",
+        "PackageCode": "1184747",
         "CommissionInfo": {"TIN": "307022362"}
     },
     "Брелок": {
@@ -205,6 +208,9 @@ products_data = {
 }
 
 def create_fiscal_item(product_name: str, quantity: int, unit_price: float) -> dict:
+    """
+    Формирует элемент фискальных данных для платежа.
+    """
     product = products_data.get(product_name)
     if not product:
         raise ValueError(f"Товар '{product_name}' не найден")
@@ -223,52 +229,6 @@ def create_fiscal_item(product_name: str, quantity: int, unit_price: float) -> d
     }
     return fiscal_item
 
-# Создаем глобальную сессию с повторными попытками
-session = requests.Session()
-session.auth = (WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def get_json(url, params=None, method="get", data=None):
-    if method == "get":
-        r = session.get(url, params=params, timeout=30)
-    else:
-        r = session.post(url, json=data, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-def find_or_create_product(product_name: str) -> int:
-    sku = products_data.get(product_name, {}).get("SPIC")
-    package_code = products_data.get(product_name, {}).get("PackageCode")
-    if not sku or not package_code:
-        logger.error("Нет данных для товара %s", product_name)
-        raise Exception(f"Нет данных для товара {product_name}")
-    url = f"{WC_API_URL}/products"
-    params = {"sku": sku}
-    try:
-        products = get_json(url, params=params, method="get")
-        if products and len(products) > 0:
-            product_id = products[0]["id"]
-            logger.info("Найден товар с SKU %s: product_id=%s", sku, product_id)
-            return product_id
-        else:
-            data = {
-                "name": product_name,
-                "sku": sku,
-                "regular_price": "0",
-                "status": "private",
-                "catalog_visibility": "hidden",
-                "meta_data": [
-                    {"key": "package_code", "value": package_code}
-                ]
-            }
-            product_created = get_json(url, method="post", data=data)
-            product_id = product_created["id"]
-            logger.info("Создан товар %s с SKU %s: product_id=%s", product_name, sku, product_id)
-            return product_id
-    except Exception as e:
-        logger.error("Ошибка поиска/создания товара %s: %s", product_name, e)
-        raise e
-
 bot = Bot(
     token=API_TOKEN,
     default=DefaultBotProperties(
@@ -282,7 +242,7 @@ dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-# --- Регистрация и выбор товара ---
+# --- Обработчики команды /start и регистрации ---
 @router.message(Command("start"))
 async def send_welcome(message: types.Message, state: FSMContext):
     await state.clear()
@@ -542,7 +502,7 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     db_cursor = db_conn.cursor(cursor_factory=RealDictCursor)
     db_cursor.execute("UPDATE orders SET admin_price = %s WHERE order_id = %s", (admin_price_sum, order_id))
     db_conn.commit()
-    logger.info("Цена %s сум сохранена для заказа %s", admin_price_sum, order_id)
+    logger.info(f"Цена {admin_price_sum} сум сохранена для заказа {order_id}.")
     db_cursor.execute("SELECT user_id, product, quantity FROM orders WHERE order_id = %s", (order_id,))
     result = db_cursor.fetchone()
     if not result:
@@ -554,27 +514,25 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     quantity = result["quantity"]
     total_amount_sum = admin_price_sum * quantity
     inline_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оплата Click", callback_data=f"client_payment_click_{order_id}")],
-        [InlineKeyboardButton(text="💳 Оплата Payme", callback_data=f"client_payment_payme_{order_id}")],
+        [InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"client_accept_order_{order_id}")],
         [InlineKeyboardButton(text="❌ Отменить заказ", callback_data=f"client_cancel_order_{order_id}")]
     ])
     await bot.send_message(
         client_id,
         f"💳 Ваш заказ №{order_id} подтвержден!\n"
         f"💰 Итоговая сумма к оплате: <b>{total_amount_sum} сум</b>.\n\n"
-        "Выберите способ оплаты:",
+        "Нажмите кнопку ниже, чтобы подтвердить заказ:",
         reply_markup=inline_kb
     )
-    await message.reply("Сумма заказа успешно отправлена клиенту для выбора способа оплаты.")
+    await message.reply("Сумма заказа успешно отправлена клиенту для подтверждения.")
     await state.clear()
 
-# Обработка оплаты через Click (оставляем без изменений)
-@router.callback_query(lambda c: c.data and c.data.startswith("client_payment_click_"))
-async def client_payment_click(callback_query: types.CallbackQuery, state: FSMContext):
+@router.callback_query(lambda c: c.data and c.data.startswith("client_accept_order_"))
+async def client_accept_order(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
     order_id = int(callback_query.data.split('_')[-1])
     db_cursor = db_conn.cursor(cursor_factory=RealDictCursor)
-    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Ожидание оплаты (Click)", order_id))
+    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Ожидание оплаты", order_id))
     db_conn.commit()
     db_cursor.execute("SELECT admin_price, product, quantity, user_id FROM orders WHERE order_id = %s", (order_id,))
     result = db_cursor.fetchone()
@@ -598,20 +556,20 @@ async def client_payment_click(callback_query: types.CallbackQuery, state: FSMCo
     BASE_URL = f"{SELF_URL}/click-api"
     payload = {
         "merchant_trans_id": merchant_trans_id,
-        "amount": total_amount_sum,
+        "amount": total_amount_sum,  # сумма платежа в суммах
         "phone_number": client_phone
     }
-    logger.info("Отправляем запрос на создание инвойса (Click) с payload: %s", json.dumps(payload, indent=2))
+    logger.info("Отправляем запрос на создание инвойса с payload: %s", json.dumps(payload, indent=2))
     try:
-        response = session.post(f"{BASE_URL}/create_invoice", json=payload, timeout=30)
+        response = requests.post(f"{BASE_URL}/create_invoice", json=payload, timeout=30)
         invoice_response = response.json()
-        logger.info("Ответ от создания инвойса (Click): %s", json.dumps(invoice_response, indent=2))
+        logger.info("Ответ от создания инвойса: %s", json.dumps(invoice_response, indent=2))
         payment_url = invoice_response.get("payment_url")
         if not payment_url and invoice_response.get("invoice_id"):
             invoice_id = invoice_response["invoice_id"]
             payment_url = f"https://api.click.uz/pay/invoice/{invoice_id}"
         if not payment_url:
-            await callback_query.message.answer("🚫 Ошибка создания инвойса. Детали: " + json.dumps(invoice_response))
+            await callback_query.message.answer("🚫 Ошибка создания инвойса. Детали: " + json.dumps(invoice_response), parse_mode=None)
             return
         db_cursor.execute("UPDATE orders SET payment_url = %s WHERE order_id = %s", (payment_url, order_id))
         db_conn.commit()
@@ -625,126 +583,7 @@ async def client_payment_click(callback_query: types.CallbackQuery, state: FSMCo
             reply_markup=inline_kb
         )
     except Exception as e:
-        await callback_query.message.answer(f"🚫 Ошибка при создании инвойса (Click): {e}")
-
-# Обработка оплаты через Payme с использованием поля items и указанием total
-@router.callback_query(lambda c: c.data and c.data.startswith("client_payment_payme_"))
-async def client_payment_payme(callback_query: types.CallbackQuery, state: FSMContext):
-    await callback_query.answer()
-    
-    # Получаем данные заказа из нашей базы
-    order_id = int(callback_query.data.split('_')[-1])
-    db_cursor = db_conn.cursor(cursor_factory=RealDictCursor)
-    db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Ожидание оплаты (Payme)", order_id))
-    db_conn.commit()
-    db_cursor.execute("SELECT admin_price, product, quantity, user_id FROM orders WHERE order_id = %s", (order_id,))
-    result = db_cursor.fetchone()
-    if not result:
-        await callback_query.message.answer("🚫 Ошибка: заказ не найден.")
-        return
-    admin_price_sum = float(result["admin_price"])
-    product = result["product"]
-    quantity = result["quantity"]
-    user_id = result["user_id"]
-    
-    # Общая сумма заказа (в сумах)
-    total_amount_sum = admin_price_sum * quantity
-
-    # В поле "price" передаем общую сумму заказа, переведенную в тийины:
-    # Если админ ввёл 1000 сум и количество 1, то 1000 * 1 * 100 = 100000 тийин
-    total_price_tiyin = int(total_amount_sum * 100)
-    
-    merchant_trans_id = f"payme_{uuid.uuid4()}"
-    db_cursor.execute("UPDATE orders SET merchant_trans_id = %s WHERE order_id = %s", (merchant_trans_id, order_id))
-    db_conn.commit()
-
-    db_cursor.execute("SELECT contact FROM clients WHERE user_id = %s", (user_id,))
-    client_data = db_cursor.fetchone()
-    client_phone = client_data["contact"] if client_data and client_data.get("contact") else ""
-
-    # Отправляем уведомление о задержке (со стороны сервера)
-    await bot.send_message(
-        callback_query.from_user.id,
-        "⚠️ Пожалуйста, подождите немного... Возможна небольшая задержка со стороны сервера 😃🙏"
-    )
-
-    # Поиск или создание товара в WooCommerce
-    try:
-        product_id = find_or_create_product(product)
-    except Exception as e:
-        await callback_query.message.answer(f"🚫 Ошибка при поиске/создании товара: {e}")
-        return
-
-    sku = products_data.get(product, {}).get("SPIC")
-    package_code = products_data.get(product, {}).get("PackageCode")
-    
-    # Формируем объект заказа с использованием ключа "items" и указываем "total" и "price"
-    orderData = {
-        "payment_method": "payme",
-        "payment_method_title": "Payme",
-        "set_paid": False,
-        "billing": {
-            "first_name": "Клиент",
-            "last_name": "",
-            "email": "client@example.com",
-            "phone": client_phone,
-            "address_1": "Адрес",
-            "address_2": "",
-            "city": "Tashkent",
-            "state": "Tashkent",
-            "postcode": "100000",
-            "country": "UZ"
-        },
-        # Общая сумма заказа (в сумах)
-        "total": f"{total_amount_sum:.2f}",
-        "items": [
-            {
-                "discount": 0,
-                "title": product,
-                # В поле "price" передается общая сумма заказа в тийинах
-                "price": total_price_tiyin,
-                "count": quantity,
-                "code": sku,
-                "units": 796,
-                "vat_percent": 0,
-                "package_code": package_code
-            }
-        ]
-    }
-
-    try:
-        response = session.post(f"{WC_API_URL}/orders", json=orderData, timeout=30)
-        wc_order = response.json()
-        order_wc_id = wc_order.get("id")
-        order_key = wc_order.get("order_key")
-        if not order_wc_id or not order_key:
-            await callback_query.message.answer("🚫 Ошибка создания заказа в WooCommerce. Детали: " + json.dumps(wc_order))
-            return
-
-        # Обновляем статус заказа, чтобы он был доступен для оплаты
-        update_data = {"status": "pending"}
-        update_response = session.put(f"{WC_API_URL}/orders/{order_wc_id}", json=update_data, timeout=30)
-        logger.info("Order status update response: %s", update_response.text)
-
-        payUrl = f"{WC_SITE_URL.rstrip('/')}/checkout/order-pay/{order_wc_id}/?key={order_key}&order_pay={order_wc_id}"
-        db_cursor.execute("UPDATE orders SET payment_url = %s WHERE order_id = %s", (payUrl, order_id))
-        db_conn.commit()
-        inline_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплатить", url=payUrl)]
-        ])
-        logger.info("Заказ создан в WooCommerce. order_id: %s, order_wc_id: %s, order_key: %s, payUrl: %s",
-                    order_id, order_wc_id, order_key, payUrl)
-        # Отправляем сообщение с кнопкой для оплаты
-        await bot.send_message(
-            callback_query.from_user.id,
-            f"💎 Ваш заказ №{order_id} успешно оформлен!\n"
-            f"💰 Итоговая сумма к оплате: <b>{total_amount_sum} сум</b>.\n\n"
-            "Нажмите кнопку ниже для перехода к оплате (Payme):",
-            reply_markup=inline_kb
-        )
-    except Exception as e:
-        logger.error("Ошибка при создании заказа в WooCommerce (Payme): %s", e)
-        await callback_query.message.answer(f"🚫 Ошибка при создании заказа в WooCommerce (Payme): {e}")
+        await callback_query.message.answer(f"🚫 Ошибка при создании инвойса: {e}", parse_mode=None)
 
 @router.callback_query(lambda c: c.data and c.data.startswith("client_cancel_order_"))
 async def client_cancel_order(callback_query: types.CallbackQuery, state: FSMContext):
@@ -776,6 +615,7 @@ async def reject_order(callback_query: types.CallbackQuery):
 # --- Обработчик кнопки "📍 Наша локация" ---
 @router.message(lambda message: message.text == "📍 Наша локация")
 async def send_static_location(message: types.Message):
+    # Отправляем фиксированную локацию
     await message.answer_location(latitude=41.306584, longitude=69.308076)
 
 # --- Обработчик кнопки "📦 Мои заказы" ---
@@ -790,6 +630,7 @@ async def show_my_orders(message: types.Message):
         return
     response_lines = []
     for order in orders:
+        # Если заказ не оплачен, статус может быть "Ожидание оплаты" или иное – выводим как "Заказан (не оплачен)"
         status = order["status"]
         if order.get("is_paid") == 1:
             status_text = "Оплачен"
@@ -814,6 +655,7 @@ async def db_management_menu(message: types.Message):
     builder.adjust(1)
     await message.answer("Выберите действие:", reply_markup=builder.as_markup())
 
+# --- Обработка действий из меню управления БД ---
 @router.callback_query(lambda c: c.data == "db_delete_client")
 async def db_delete_client(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
