@@ -1,3 +1,4 @@
+# payment_api.py
 import os
 import sys
 import logging
@@ -31,10 +32,8 @@ PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 SELF_URL = os.getenv("SELF_URL")
-# Новые переменные для формирования ссылки оплаты
-MERCHANT_ID = os.getenv("MERCHANT_ID")  # Например, 35108
-RETURN_URL = os.getenv("RETURN_URL")    # Например, https://yourdomain.com/payment_result
 
+# Подключаемся к PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL не установлена")
@@ -85,9 +84,6 @@ def generate_auth_header():
     app.logger.info("Сгенерирован auth header: %s", header)
     return header
 
-def md5_hash(s):
-    return hashlib.md5(s.encode('utf-8')).hexdigest()
-
 def notify_admins(message_text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": GROUP_CHAT_ID, "text": message_text, "parse_mode": "HTML"}
@@ -97,9 +93,6 @@ def notify_admins(message_text):
     except Exception as e:
         app.logger.error("Ошибка отправки уведомления в Telegram: %s", e)
 
-# =======================
-# Эндпоинт: Создание инвойса
-# =======================
 @app.route("/click-api/create_invoice", methods=["POST"])
 def create_invoice():
     app.logger.info("Получен запрос на создание инвойса: %s", request.data.decode())
@@ -131,7 +124,7 @@ def create_invoice():
     }
     payload = {
         "service_id": SERVICE_ID,
-        "amount": amount,
+        "amount": amount,  # сумма платежа в суммах
         "phone_number": phone_number,
         "merchant_trans_id": merchant_trans_id
     }
@@ -152,28 +145,15 @@ def create_invoice():
             }), 200
         invoice_data = resp.json()
         app.logger.info("Invoice created: %s", json.dumps(invoice_data, indent=2))
-        
-        # Если инвойс создан успешно, формируем ссылку для оплаты согласно новому формату.
-        if invoice_data.get("error_code") == 0 and invoice_data.get("invoice_id"):
-            payment_url = f"https://my.click.uz/services/pay?service_id={SERVICE_ID}&merchant_id={MERCHANT_ID}&amount={amount}&transaction_param={merchant_trans_id}&return_url={RETURN_URL}"
-            invoice_data["payment_url"] = payment_url
-            app.logger.info("Сформирован payment_url: %s", payment_url)
-        
         return jsonify(invoice_data), 200
     except Exception as e:
         app.logger.error("Invoice creation exception: %s", str(e))
         return jsonify({"error": "-9", "error_note": str(e)}), 200
 
-# =======================
-# Эндпоинт: Prepare
-# =======================
 @app.route("/click-api/prepare", methods=["POST"])
 def prepare():
     app.logger.info("Получен запрос на prepare: %s", request.data.decode())
-    required_fields = [
-        "click_trans_id", "service_id", "click_paydoc_id",
-        "merchant_trans_id", "amount", "action", "sign_time", "sign_string"
-    ]
+    required_fields = ["click_trans_id", "merchant_trans_id", "amount"]
     for field in required_fields:
         if field not in request.form:
             error_msg = f"Missing field: {field}"
@@ -181,76 +161,30 @@ def prepare():
             return jsonify({"error": "-8", "error_note": error_msg}), 400
 
     click_trans_id = request.form["click_trans_id"]
-    service_id = request.form["service_id"]
-    click_paydoc_id = request.form["click_paydoc_id"]
     merchant_trans_id = request.form["merchant_trans_id"]
-    try:
-        amount = float(request.form["amount"])
-    except Exception as e:
-        error_msg = f"Ошибка преобразования amount: {e}"
-        app.logger.error(error_msg)
-        return jsonify({"error": "-8", "error_note": error_msg}), 400
-    action = request.form["action"]
-    sign_time = request.form["sign_time"]
-    sign_string = request.form["sign_string"]
-
-    if action != "0":
-        error_msg = "Неверное значение параметра action для Prepare (ожидается 0)"
-        app.logger.error(error_msg)
-        return jsonify({"error": "-8", "error_note": error_msg}), 400
-
-    # Подсчет подписи: MD5( click_trans_id + service_id + SECRET_KEY + merchant_trans_id + amount + action + sign_time )
-    data_str = f"{click_trans_id}{service_id}{SECRET_KEY}{merchant_trans_id}{amount}{action}{sign_time}"
-    expected_sign = md5_hash(data_str)
-    if expected_sign != sign_string:
-        error_msg = "Неверная подпись (sign_string) в запросе Prepare"
-        app.logger.error(error_msg)
-        return jsonify({"error": "-8", "error_note": error_msg}), 400
-
-    # Если заказ уже существует, обновляем его, иначе создаем новый
+    app.logger.info("Prepare: click_trans_id=%s, merchant_trans_id=%s", click_trans_id, merchant_trans_id)
     cursor.execute("UPDATE orders SET status=%s, cost_info=%s WHERE merchant_trans_id=%s", 
                    ("pending", click_trans_id, merchant_trans_id))
     if cursor.rowcount == 0:
-        cursor.execute(
-            "INSERT INTO orders (merchant_trans_id, status, cost_info) VALUES (%s, %s, %s) RETURNING order_id",
-            (merchant_trans_id, "pending", click_trans_id)
-        )
-        new_order = cursor.fetchone()
-        if new_order and new_order.get("order_id"):
-            merchant_prepare_id = new_order["order_id"]
-        else:
-            merchant_prepare_id = merchant_trans_id
-        app.logger.info("Новый заказ создан в режиме prepare, order_id: %s", merchant_prepare_id)
+        cursor.execute("INSERT INTO orders (merchant_trans_id, status, cost_info) VALUES (%s, %s, %s)",
+                       (merchant_trans_id, "pending", click_trans_id))
+        app.logger.info("Новый заказ создан в режиме prepare.")
     else:
-        cursor.execute("SELECT order_id FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
-        row = cursor.fetchone()
-        if row and row.get("order_id"):
-            merchant_prepare_id = row["order_id"]
-        else:
-            merchant_prepare_id = merchant_trans_id
-        app.logger.info("Заказ обновлён в режиме prepare, order_id: %s", merchant_prepare_id)
-
+        app.logger.info("Заказ обновлён в режиме prepare.")
     response = {
         "click_trans_id": click_trans_id,
         "merchant_trans_id": merchant_trans_id,
-        "merchant_prepare_id": merchant_prepare_id,
+        "merchant_prepare_id": merchant_trans_id,
         "error": "0",
         "error_note": "Success"
     }
     app.logger.info("Ответ prepare: %s", json.dumps(response, indent=2))
     return jsonify(response)
 
-# =======================
-# Эндпоинт: Complete
-# =======================
 @app.route("/click-api/complete", methods=["POST"])
 def complete():
     app.logger.info("Получен запрос на complete: %s", request.data.decode())
-    required_fields = [
-        "click_trans_id", "service_id", "click_paydoc_id",
-        "merchant_trans_id", "merchant_prepare_id", "amount",
-        "action", "sign_time", "sign_string"
-    ]
+    required_fields = ["click_trans_id", "merchant_trans_id", "merchant_prepare_id", "amount"]
     for field in required_fields:
         if field not in request.form:
             error_msg = f"Missing field: {field}"
@@ -258,8 +192,6 @@ def complete():
             return jsonify({"error": "-8", "error_note": error_msg}), 400
 
     click_trans_id = request.form["click_trans_id"]
-    service_id = request.form["service_id"]
-    click_paydoc_id = request.form["click_paydoc_id"]
     merchant_trans_id = request.form["merchant_trans_id"]
     merchant_prepare_id = request.form["merchant_prepare_id"]
     try:
@@ -268,29 +200,56 @@ def complete():
         error_msg = f"Ошибка преобразования amount: {e}"
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
-    action = request.form["action"]
-    sign_time = request.form["sign_time"]
-    sign_string = request.form["sign_string"]
 
-    if action != "1":
-        error_msg = "Неверное значение параметра action для Complete (ожидается 1)"
+    # Извлекаем unit_price из БД (admin_price вводится администратором в суммах)
+    cursor.execute("SELECT admin_price FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
+    row = cursor.fetchone()
+    app.logger.info("Данные заказа для unit_price: %s", row)
+    if row and row.get("admin_price"):
+        admin_price = float(row["admin_price"])
+        unit_price = admin_price * 100  # переводим в тийины
+        app.logger.info("unit_price взят из БД: admin_price=%s, unit_price=%s", admin_price, unit_price)
+    else:
+        error_msg = "Missing field: unit_price and не удалось извлечь из БД"
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Подсчет подписи: MD5( click_trans_id + service_id + SECRET_KEY + merchant_trans_id + merchant_prepare_id + amount + action + sign_time )
-    data_str = f"{click_trans_id}{service_id}{SECRET_KEY}{merchant_trans_id}{merchant_prepare_id}{amount}{action}{sign_time}"
-    expected_sign = md5_hash(data_str)
-    if expected_sign != sign_string:
-        error_msg = "Неверная подпись (sign_string) в запросе Complete"
-        app.logger.error(error_msg)
-        return jsonify({"error": "-8", "error_note": error_msg}), 400
+    # Извлекаем quantity; если не передано, берем из БД
+    quantity_str = request.form.get("quantity")
+    if quantity_str:
+        try:
+            quantity = int(quantity_str)
+        except Exception as e:
+            error_msg = f"Ошибка преобразования quantity: {e}"
+            app.logger.error(error_msg)
+            return jsonify({"error": "-8", "error_note": error_msg}), 400
+    else:
+        cursor.execute("SELECT quantity FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
+        row = cursor.fetchone()
+        if row and row.get("quantity"):
+            quantity = int(row["quantity"])
+            app.logger.info("Количество (quantity) взято из БД: %s", quantity)
+        else:
+            error_msg = "Missing field: quantity and не удалось извлечь из БД"
+            app.logger.error(error_msg)
+            return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Дополнительные параметры error и error_note от CLICK (если передаются)
-    error_param = request.form.get("error", "0")
-    error_note_param = request.form.get("error_note", "")
+    # Извлекаем название товара из заказа (из поля product)
+    cursor.execute("SELECT product FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
+    row = cursor.fetchone()
+    if row and row.get("product"):
+        product_name = row["product"]
+    else:
+        product_name = "Неизвестный товар"
+
+    app.logger.info(
+        "Параметры /complete: click_trans_id=%s, merchant_trans_id=%s, amount=%s, product_name=%s, quantity=%s, unit_price=%s",
+        click_trans_id, merchant_trans_id, amount, product_name, quantity, unit_price
+    )
 
     cursor.execute("SELECT * FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
     order_row = cursor.fetchone()
+    app.logger.info("Содержимое заказа: %s", order_row)
     if not order_row:
         error_msg = "Order not found"
         app.logger.error(error_msg)
@@ -300,32 +259,8 @@ def complete():
         app.logger.error(error_msg)
         return jsonify({"error": "-4", "error_note": error_msg}), 400
 
-    # Отмечаем заказ как оплаченный и переводим статус в 'processing'
     cursor.execute("UPDATE orders SET is_paid=1, status='processing' WHERE merchant_trans_id=%s", (merchant_trans_id,))
     conn.commit()
-
-    # Получаем данные для фискализации (например, admin_price, product, quantity)
-    cursor.execute("SELECT admin_price, product, quantity FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
-    row = cursor.fetchone()
-    if row and row.get("admin_price"):
-        try:
-            admin_price = float(row["admin_price"])
-        except Exception as e:
-            error_msg = f"Ошибка преобразования admin_price: {e}"
-            app.logger.error(error_msg)
-            return jsonify({"error": "-8", "error_note": error_msg}), 400
-        unit_price = admin_price * 100  # переводим в тийины
-    else:
-        error_msg = "Отсутствует admin_price в заказе"
-        app.logger.error(error_msg)
-        return jsonify({"error": "-8", "error_note": error_msg}), 400
-
-    quantity = row.get("quantity", 1)
-    product_name = row.get("product", "Неизвестный товар")
-    app.logger.info(
-        "Параметры /complete: click_trans_id=%s, merchant_trans_id=%s, amount=%s, product_name=%s, quantity=%s, unit_price=%s",
-        click_trans_id, merchant_trans_id, amount, product_name, quantity, unit_price
-    )
 
     try:
         fiscal_item = create_fiscal_item(product_name, quantity, unit_price)
@@ -336,7 +271,6 @@ def complete():
         app.logger.error(error_msg)
         return jsonify({"error": "-10", "error_note": error_msg}), 400
 
-    # Отправляем фискальные данные
     fiscal_headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -348,7 +282,7 @@ def complete():
         "service_id": SERVICE_ID,
         "payment_id": click_trans_id,
         "items": fiscal_items,
-        "received_ecash": amount,
+        "received_ecash": amount,  # сумма платежа в суммах
         "received_cash": 0,
         "received_card": 0
     }
@@ -383,87 +317,9 @@ def complete():
     app.logger.info("Ответ /complete отправлен: %s", json.dumps(response, indent=2, ensure_ascii=False))
     return jsonify(response)
 
-# =======================
-# Эндпоинт: Проверка статуса инвойса
-# =======================
-@app.route("/click-api/invoice/status/<int:service_id>/<int:invoice_id>", methods=["GET"])
-def invoice_status(service_id, invoice_id):
-    url = f"https://api.click.uz/v2/merchant/invoice/status/{service_id}/{invoice_id}"
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Auth": generate_auth_header()
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=30)
-        app.logger.info("Invoice status response: %s", resp.text)
-        return jsonify(resp.json()), resp.status_code
-    except Exception as e:
-        app.logger.error("Error checking invoice status: %s", str(e))
-        return jsonify({"error": "-9", "error_note": str(e)}), 500
-
-# =======================
-# Эндпоинт: Проверка статуса платежа (по payment_id)
-# =======================
-@app.route("/click-api/payment/status/<int:service_id>/<int:payment_id>", methods=["GET"])
-def payment_status(service_id, payment_id):
-    url = f"https://api.click.uz/v2/merchant/payment/status/{service_id}/{payment_id}"
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Auth": generate_auth_header()
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=30)
-        app.logger.info("Payment status response: %s", resp.text)
-        return jsonify(resp.json()), resp.status_code
-    except Exception as e:
-        app.logger.error("Error checking payment status: %s", str(e))
-        return jsonify({"error": "-9", "error_note": str(e)}), 500
-
-# =======================
-# Эндпоинт: Проверка статуса платежа по merchant_trans_id
-# =======================
-@app.route("/click-api/payment/status_by_mti/<int:service_id>/<merchant_trans_id>/<date_str>", methods=["GET"])
-def payment_status_by_mti(service_id, merchant_trans_id, date_str):
-    url = f"https://api.click.uz/v2/merchant/payment/status_by_mti/{service_id}/{merchant_trans_id}/{date_str}"
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Auth": generate_auth_header()
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=30)
-        app.logger.info("Payment status by MTI response: %s", resp.text)
-        return jsonify(resp.json()), resp.status_code
-    except Exception as e:
-        app.logger.error("Error checking payment status by MTI: %s", str(e))
-        return jsonify({"error": "-9", "error_note": str(e)}), 500
-
-# =======================
-# Эндпоинт: Снятие платежа (отмена)
-# =======================
-@app.route("/click-api/payment/reversal/<int:service_id>/<int:payment_id>", methods=["DELETE"])
-def payment_reversal(service_id, payment_id):
-    url = f"https://api.click.uz/v2/merchant/payment/reversal/{service_id}/{payment_id}"
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Auth": generate_auth_header()
-    }
-    try:
-        resp = requests.delete(url, headers=headers, timeout=30)
-        app.logger.info("Payment reversal response: %s", resp.text)
-        return jsonify(resp.json()), resp.status_code
-    except Exception as e:
-        app.logger.error("Error performing payment reversal: %s", str(e))
-        return jsonify({"error": "-9", "error_note": str(e)}), 500
-
-# =======================
-# Функция автопинга для поддержки активности инстанса
-# =======================
 def auto_ping():
     """
+    Функция автопинга для поддержания активности инстанса на Render.com.
     Каждые 4 минуты отправляет GET-запрос к SELF_URL.
     """
     while True:

@@ -1,3 +1,4 @@
+# bot.py
 import os
 import os.path
 import sys
@@ -107,7 +108,6 @@ except Exception as e:
     logger.error("Ошибка создания таблиц (бот): %s", e)
     raise
 
-# FSM для заказа товара
 class OrderForm(StatesGroup):
     contact = State()
     name = State()
@@ -118,18 +118,14 @@ class OrderForm(StatesGroup):
     location = State()
     delivery_comment = State()
 
-# FSM для ввода суммы администратором
 class AdminPriceState(StatesGroup):
     waiting_for_price = State()
 
-# FSM для управления базой данных (админ)
-class DBManagementState(StatesGroup):
-    waiting_for_client_id = State()
-    waiting_for_order_id = State()
-
 def get_main_keyboard(is_admin=False, is_registered=False):
     """
-    Формирует основную клавиатуру.
+    Формирует основную клавиатуру. Если пользователь не зарегистрирован,
+    добавляется кнопка для отправки контакта, которая допустима только в приватных чатах.
+    Поэтому, если вызывается из группового чата или от администратора, нужно передавать is_registered=True.
     """
     builder = ReplyKeyboardBuilder()
     builder.button(text='🔄 Начать сначала')
@@ -158,7 +154,7 @@ def get_product_keyboard():
     builder.adjust(2)
     return builder.as_markup()
 
-# --- Фискальные данные ---
+# --- Блок фискальных данных (из fiscal.py) ---
 products_data = {
     "Кружка": {
         "SPIC": "06912001036000000",
@@ -210,6 +206,11 @@ products_data = {
 def create_fiscal_item(product_name: str, quantity: int, unit_price: float) -> dict:
     """
     Формирует элемент фискальных данных для платежа.
+    
+    :param product_name: Название товара (например, "Кружка")
+    :param quantity: Количество товара
+    :param unit_price: Цена за единицу (в тийинах)
+    :return: Словарь с фискальными данными
     """
     product = products_data.get(product_name)
     if not product:
@@ -242,7 +243,6 @@ dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-# --- Обработчики команды /start и регистрации ---
 @router.message(Command("start"))
 async def send_welcome(message: types.Message, state: FSMContext):
     await state.clear()
@@ -310,7 +310,6 @@ async def register_name(message: types.Message, state: FSMContext):
     await message.answer("🌟 Пожалуйста, выберите товар из нашего ассортимента:", reply_markup=get_product_keyboard())
     await state.set_state(OrderForm.product)
 
-# --- Обработка выбора товара и создание заказа ---
 @router.callback_query(lambda c: c.data and c.data.startswith('product_'), StateFilter(OrderForm.product))
 async def process_product_selection(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
@@ -480,6 +479,7 @@ async def approve_order(callback_query: types.CallbackQuery, state: FSMContext):
     db_cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Ожидание суммы", order_id))
     db_conn.commit()
     await state.update_data(order_id=order_id)
+    # Здесь важно передавать is_registered=True, чтобы не добавлялась кнопка с запросом контакта
     await callback_query.message.answer(
         f"💰 Пожалуйста, введите итоговую сумму заказа (в суммах) для заказа №{order_id}:",
         reply_markup=get_main_keyboard(is_admin=True, is_registered=True)
@@ -611,109 +611,6 @@ async def reject_order(callback_query: types.CallbackQuery):
         client_id = result["user_id"]
         await bot.send_message(client_id, f"🚫 Ваш заказ №{order_id} был отклонён.")
     await callback_query.answer("Заказ отклонён.", show_alert=True)
-
-# --- Обработчик кнопки "📍 Наша локация" ---
-@router.message(lambda message: message.text == "📍 Наша локация")
-async def send_static_location(message: types.Message):
-    # Отправляем фиксированную локацию
-    await message.answer_location(latitude=41.306584, longitude=69.308076)
-
-# --- Обработчик кнопки "📦 Мои заказы" ---
-@router.message(lambda message: message.text == "📦 Мои заказы")
-async def show_my_orders(message: types.Message):
-    user_id = message.from_user.id
-    cur = db_conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT order_id, product, quantity, order_time, status, is_paid FROM orders WHERE user_id = %s ORDER BY order_time DESC", (user_id,))
-    orders = cur.fetchall()
-    if not orders:
-        await message.answer("У вас нет заказов.", reply_markup=get_main_keyboard(message.from_user.id in ADMIN_CHAT_IDS, True))
-        return
-    response_lines = []
-    for order in orders:
-        # Если заказ не оплачен, статус может быть "Ожидание оплаты" или иное – выводим как "Заказан (не оплачен)"
-        status = order["status"]
-        if order.get("is_paid") == 1:
-            status_text = "Оплачен"
-        else:
-            status_text = status if status else "Заказан (не оплачен)"
-        order_time = order["order_time"].strftime('%Y-%m-%d %H:%M')
-        line = f"№{order['order_id']}: {order['product']} x{order['quantity']} | {status_text} | {order_time}"
-        response_lines.append(line)
-    response_text = "📦 Ваши заказы:\n" + "\n".join(response_lines)
-    await message.answer(response_text, reply_markup=get_main_keyboard(message.from_user.id in ADMIN_CHAT_IDS, True))
-
-# --- Обработчик кнопки "🔧 Управление базой данных" (только для админов) ---
-@router.message(lambda message: message.text == "🔧 Управление базой данных")
-async def db_management_menu(message: types.Message):
-    if message.from_user.id not in ADMIN_CHAT_IDS:
-        await message.answer("У вас нет прав для управления базой данных.")
-        return
-    builder = InlineKeyboardBuilder()
-    builder.button(text="Удалить клиента", callback_data="db_delete_client")
-    builder.button(text="Удалить заказ", callback_data="db_delete_order")
-    builder.button(text="Очистить заказы", callback_data="db_clear_orders")
-    builder.adjust(1)
-    await message.answer("Выберите действие:", reply_markup=builder.as_markup())
-
-# --- Обработка действий из меню управления БД ---
-@router.callback_query(lambda c: c.data == "db_delete_client")
-async def db_delete_client(callback_query: types.CallbackQuery, state: FSMContext):
-    await callback_query.answer()
-    await callback_query.message.answer("Введите user_id клиента для удаления:")
-    await state.set_state(DBManagementState.waiting_for_client_id)
-
-@router.message(DBManagementState.waiting_for_client_id)
-async def process_client_deletion(message: types.Message, state: FSMContext):
-    user_id_text = message.text.strip()
-    if not user_id_text.isdigit():
-        await message.answer("User ID должен быть числом.")
-        return
-    user_id = int(user_id_text)
-    cur = db_conn.cursor()
-    cur.execute("DELETE FROM clients WHERE user_id = %s", (user_id,))
-    db_conn.commit()
-    await message.answer(f"Клиент с user_id={user_id} удалён (если он существовал).", reply_markup=get_main_keyboard(message.from_user.id in ADMIN_CHAT_IDS, True))
-    await state.clear()
-
-@router.callback_query(lambda c: c.data == "db_delete_order")
-async def db_delete_order(callback_query: types.CallbackQuery, state: FSMContext):
-    await callback_query.answer()
-    await callback_query.message.answer("Введите order_id заказа для удаления:")
-    await state.set_state(DBManagementState.waiting_for_order_id)
-
-@router.message(DBManagementState.waiting_for_order_id)
-async def process_order_deletion(message: types.Message, state: FSMContext):
-    order_id_text = message.text.strip()
-    if not order_id_text.isdigit():
-        await message.answer("Order ID должен быть числом.")
-        return
-    order_id = int(order_id_text)
-    cur = db_conn.cursor()
-    cur.execute("DELETE FROM orders WHERE order_id = %s", (order_id,))
-    db_conn.commit()
-    await message.answer(f"Заказ с order_id={order_id} удалён (если он существовал).", reply_markup=get_main_keyboard(message.from_user.id in ADMIN_CHAT_IDS, True))
-    await state.clear()
-
-@router.callback_query(lambda c: c.data == "db_clear_orders")
-async def db_clear_orders(callback_query: types.CallbackQuery):
-    await callback_query.answer()
-    builder = InlineKeyboardBuilder()
-    builder.button(text="Подтвердить удаление всех заказов", callback_data="db_clear_orders_confirm")
-    builder.button(text="Отмена", callback_data="db_clear_orders_cancel")
-    await callback_query.message.answer("Вы действительно хотите удалить все заказы?", reply_markup=builder.as_markup())
-
-@router.callback_query(lambda c: c.data == "db_clear_orders_confirm")
-async def db_clear_orders_confirm(callback_query: types.CallbackQuery):
-    await callback_query.answer()
-    cur = db_conn.cursor()
-    cur.execute("DELETE FROM orders")
-    db_conn.commit()
-    await callback_query.message.edit_text("Все заказы удалены.")
-
-@router.callback_query(lambda c: c.data == "db_clear_orders_cancel")
-async def db_clear_orders_cancel(callback_query: types.CallbackQuery):
-    await callback_query.answer("Действие отменено.")
-    await callback_query.message.edit_text("Действие отменено.")
 
 async def main():
     await dp.start_polling(bot)
