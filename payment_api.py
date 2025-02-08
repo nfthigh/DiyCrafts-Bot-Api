@@ -1,4 +1,3 @@
-# payment_api.py
 import os
 import sys
 import logging
@@ -16,7 +15,6 @@ from fiscal import create_fiscal_item  # Функция формирования
 # Загружаем переменные окружения из .env
 load_dotenv()
 
-# Настроим логирование в консоль (stdout)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -33,7 +31,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 SELF_URL = os.getenv("SELF_URL")
 
-# Подключаемся к PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL не установлена")
@@ -84,6 +81,9 @@ def generate_auth_header():
     app.logger.info("Сгенерирован auth header: %s", header)
     return header
 
+def md5_hash(s):
+    return hashlib.md5(s.encode('utf-8')).hexdigest()
+
 def notify_admins(message_text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": GROUP_CHAT_ID, "text": message_text, "parse_mode": "HTML"}
@@ -124,7 +124,7 @@ def create_invoice():
     }
     payload = {
         "service_id": SERVICE_ID,
-        "amount": amount,  # сумма платежа в суммах
+        "amount": amount,
         "phone_number": phone_number,
         "merchant_trans_id": merchant_trans_id
     }
@@ -153,7 +153,11 @@ def create_invoice():
 @app.route("/click-api/prepare", methods=["POST"])
 def prepare():
     app.logger.info("Получен запрос на prepare: %s", request.data.decode())
-    required_fields = ["click_trans_id", "merchant_trans_id", "amount"]
+    # Обязательные параметры согласно документации Prepare
+    required_fields = [
+        "click_trans_id", "service_id", "click_paydoc_id",
+        "merchant_trans_id", "amount", "action", "sign_time", "sign_string"
+    ]
     for field in required_fields:
         if field not in request.form:
             error_msg = f"Missing field: {field}"
@@ -161,20 +165,61 @@ def prepare():
             return jsonify({"error": "-8", "error_note": error_msg}), 400
 
     click_trans_id = request.form["click_trans_id"]
+    service_id = request.form["service_id"]
+    click_paydoc_id = request.form["click_paydoc_id"]
     merchant_trans_id = request.form["merchant_trans_id"]
-    app.logger.info("Prepare: click_trans_id=%s, merchant_trans_id=%s", click_trans_id, merchant_trans_id)
+    try:
+        amount = float(request.form["amount"])
+    except Exception as e:
+        error_msg = f"Ошибка преобразования amount: {e}"
+        app.logger.error(error_msg)
+        return jsonify({"error": "-8", "error_note": error_msg}), 400
+    action = request.form["action"]
+    sign_time = request.form["sign_time"]
+    sign_string = request.form["sign_string"]
+
+    # Для Prepare action должно быть равно "0"
+    if action != "0":
+        error_msg = "Неверное значение параметра action для Prepare (ожидается 0)"
+        app.logger.error(error_msg)
+        return jsonify({"error": "-8", "error_note": error_msg}), 400
+
+    # Вычисляем подпись согласно MD5( click_trans_id + service_id + SECRET_KEY + merchant_trans_id + amount + action + sign_time )
+    data_str = f"{click_trans_id}{service_id}{SECRET_KEY}{merchant_trans_id}{amount}{action}{sign_time}"
+    expected_sign = md5_hash(data_str)
+    if expected_sign != sign_string:
+        error_msg = "Неверная подпись (sign_string) в запросе Prepare"
+        app.logger.error(error_msg)
+        return jsonify({"error": "-8", "error_note": error_msg}), 400
+
+    # Резервируем заказ: если заказ с данным merchant_trans_id уже существует – обновляем статус,
+    # иначе создаём новый заказ и получаем order_id как merchant_prepare_id
     cursor.execute("UPDATE orders SET status=%s, cost_info=%s WHERE merchant_trans_id=%s", 
                    ("pending", click_trans_id, merchant_trans_id))
     if cursor.rowcount == 0:
-        cursor.execute("INSERT INTO orders (merchant_trans_id, status, cost_info) VALUES (%s, %s, %s)",
-                       (merchant_trans_id, "pending", click_trans_id))
-        app.logger.info("Новый заказ создан в режиме prepare.")
+        cursor.execute(
+            "INSERT INTO orders (merchant_trans_id, status, cost_info) VALUES (%s, %s, %s) RETURNING order_id",
+            (merchant_trans_id, "pending", click_trans_id)
+        )
+        new_order = cursor.fetchone()
+        if new_order and new_order.get("order_id"):
+            merchant_prepare_id = new_order["order_id"]
+        else:
+            merchant_prepare_id = merchant_trans_id
+        app.logger.info("Новый заказ создан в режиме prepare, order_id: %s", merchant_prepare_id)
     else:
-        app.logger.info("Заказ обновлён в режиме prepare.")
+        cursor.execute("SELECT order_id FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
+        row = cursor.fetchone()
+        if row and row.get("order_id"):
+            merchant_prepare_id = row["order_id"]
+        else:
+            merchant_prepare_id = merchant_trans_id
+        app.logger.info("Заказ обновлён в режиме prepare, order_id: %s", merchant_prepare_id)
+
     response = {
         "click_trans_id": click_trans_id,
         "merchant_trans_id": merchant_trans_id,
-        "merchant_prepare_id": merchant_trans_id,
+        "merchant_prepare_id": merchant_prepare_id,
         "error": "0",
         "error_note": "Success"
     }
@@ -184,7 +229,12 @@ def prepare():
 @app.route("/click-api/complete", methods=["POST"])
 def complete():
     app.logger.info("Получен запрос на complete: %s", request.data.decode())
-    required_fields = ["click_trans_id", "merchant_trans_id", "merchant_prepare_id", "amount"]
+    # Обязательные параметры согласно документации Complete
+    required_fields = [
+        "click_trans_id", "service_id", "click_paydoc_id",
+        "merchant_trans_id", "merchant_prepare_id", "amount",
+        "action", "sign_time", "sign_string"
+    ]
     for field in required_fields:
         if field not in request.form:
             error_msg = f"Missing field: {field}"
@@ -192,6 +242,8 @@ def complete():
             return jsonify({"error": "-8", "error_note": error_msg}), 400
 
     click_trans_id = request.form["click_trans_id"]
+    service_id = request.form["service_id"]
+    click_paydoc_id = request.form["click_paydoc_id"]
     merchant_trans_id = request.form["merchant_trans_id"]
     merchant_prepare_id = request.form["merchant_prepare_id"]
     try:
@@ -200,56 +252,30 @@ def complete():
         error_msg = f"Ошибка преобразования amount: {e}"
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
+    action = request.form["action"]
+    sign_time = request.form["sign_time"]
+    sign_string = request.form["sign_string"]
 
-    # Извлекаем unit_price из БД (admin_price вводится администратором в суммах)
-    cursor.execute("SELECT admin_price FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
-    row = cursor.fetchone()
-    app.logger.info("Данные заказа для unit_price: %s", row)
-    if row and row.get("admin_price"):
-        admin_price = float(row["admin_price"])
-        unit_price = admin_price * 100  # переводим в тийины
-        app.logger.info("unit_price взят из БД: admin_price=%s, unit_price=%s", admin_price, unit_price)
-    else:
-        error_msg = "Missing field: unit_price and не удалось извлечь из БД"
+    # Для Complete action должно быть равно "1"
+    if action != "1":
+        error_msg = "Неверное значение параметра action для Complete (ожидается 1)"
         app.logger.error(error_msg)
         return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Извлекаем quantity; если не передано, берем из БД
-    quantity_str = request.form.get("quantity")
-    if quantity_str:
-        try:
-            quantity = int(quantity_str)
-        except Exception as e:
-            error_msg = f"Ошибка преобразования quantity: {e}"
-            app.logger.error(error_msg)
-            return jsonify({"error": "-8", "error_note": error_msg}), 400
-    else:
-        cursor.execute("SELECT quantity FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
-        row = cursor.fetchone()
-        if row and row.get("quantity"):
-            quantity = int(row["quantity"])
-            app.logger.info("Количество (quantity) взято из БД: %s", quantity)
-        else:
-            error_msg = "Missing field: quantity and не удалось извлечь из БД"
-            app.logger.error(error_msg)
-            return jsonify({"error": "-8", "error_note": error_msg}), 400
+    # Вычисляем подпись согласно MD5( click_trans_id + service_id + SECRET_KEY + merchant_trans_id + merchant_prepare_id + amount + action + sign_time )
+    data_str = f"{click_trans_id}{service_id}{SECRET_KEY}{merchant_trans_id}{merchant_prepare_id}{amount}{action}{sign_time}"
+    expected_sign = md5_hash(data_str)
+    if expected_sign != sign_string:
+        error_msg = "Неверная подпись (sign_string) в запросе Complete"
+        app.logger.error(error_msg)
+        return jsonify({"error": "-8", "error_note": error_msg}), 400
 
-    # Извлекаем название товара из заказа (из поля product)
-    cursor.execute("SELECT product FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
-    row = cursor.fetchone()
-    if row and row.get("product"):
-        product_name = row["product"]
-    else:
-        product_name = "Неизвестный товар"
-
-    app.logger.info(
-        "Параметры /complete: click_trans_id=%s, merchant_trans_id=%s, amount=%s, product_name=%s, quantity=%s, unit_price=%s",
-        click_trans_id, merchant_trans_id, amount, product_name, quantity, unit_price
-    )
+    # Дополнительные параметры от CLICK (error и error_note) можно получить, если передаются
+    error_param = request.form.get("error", "0")
+    error_note_param = request.form.get("error_note", "")
 
     cursor.execute("SELECT * FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
     order_row = cursor.fetchone()
-    app.logger.info("Содержимое заказа: %s", order_row)
     if not order_row:
         error_msg = "Order not found"
         app.logger.error(error_msg)
@@ -259,8 +285,32 @@ def complete():
         app.logger.error(error_msg)
         return jsonify({"error": "-4", "error_note": error_msg}), 400
 
+    # Отмечаем заказ как оплаченный и переводим его в статус 'processing'
     cursor.execute("UPDATE orders SET is_paid=1, status='processing' WHERE merchant_trans_id=%s", (merchant_trans_id,))
     conn.commit()
+
+    # Извлекаем данные для формирования фискальных данных
+    cursor.execute("SELECT admin_price, product, quantity FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
+    row = cursor.fetchone()
+    if row and row.get("admin_price"):
+        try:
+            admin_price = float(row["admin_price"])
+        except Exception as e:
+            error_msg = f"Ошибка преобразования admin_price: {e}"
+            app.logger.error(error_msg)
+            return jsonify({"error": "-8", "error_note": error_msg}), 400
+        unit_price = admin_price * 100  # перевод в тийины
+    else:
+        error_msg = "Отсутствует admin_price в заказе"
+        app.logger.error(error_msg)
+        return jsonify({"error": "-8", "error_note": error_msg}), 400
+
+    quantity = row.get("quantity", 1)
+    product_name = row.get("product", "Неизвестный товар")
+    app.logger.info(
+        "Параметры /complete: click_trans_id=%s, merchant_trans_id=%s, amount=%s, product_name=%s, quantity=%s, unit_price=%s",
+        click_trans_id, merchant_trans_id, amount, product_name, quantity, unit_price
+    )
 
     try:
         fiscal_item = create_fiscal_item(product_name, quantity, unit_price)
@@ -271,6 +321,7 @@ def complete():
         app.logger.error(error_msg)
         return jsonify({"error": "-10", "error_note": error_msg}), 400
 
+    # Отправляем фискальные данные
     fiscal_headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -282,7 +333,7 @@ def complete():
         "service_id": SERVICE_ID,
         "payment_id": click_trans_id,
         "items": fiscal_items,
-        "received_ecash": amount,  # сумма платежа в суммах
+        "received_ecash": amount,
         "received_cash": 0,
         "received_card": 0
     }
