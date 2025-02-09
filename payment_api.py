@@ -38,7 +38,7 @@ except Exception as e:
     logger.error("Ошибка подключения к БД (payment_api): %s", e)
     raise
 
-# Обновляем схему: создаем таблицу orders, если её нет, и добавляем столбцы merchant_prepare_id и merchant_trans_id
+# Обновляем схему: создаем таблицу orders (если её нет) и добавляем столбцы merchant_prepare_id и merchant_trans_id
 try:
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS orders (
@@ -64,7 +64,7 @@ try:
 except Exception as e:
     logger.error("Ошибка обновления схемы базы данных: %s", e)
 
-# Пример каталога товаров для формирования фискальных данных
+# Пример каталога товаров для фискальных данных
 products_data = {
     "Кружка": {
         "SPIC": "06912001036000000",
@@ -141,21 +141,29 @@ def build_fiscal_item(order):
         "CommissionInfo": product_info["CommissionInfo"]
     }
 
-# Для Prepare и Complete мы ищем заказ по merchant_trans_id
 def extract_order_by_mti(merchant_trans_id):
     cursor.execute("SELECT * FROM orders WHERE merchant_trans_id = %s", (merchant_trans_id,))
     return cursor.fetchone()
 
 @app.route('/click/prepare', methods=['POST'])
 def click_prepare():
+    logger.info("Запрос PREPARE получен")
+    logger.info("Headers: %s", request.headers)
+    logger.info("Body: %s", request.data)
     try:
-        logger.info("Запрос PREPARE получен")
-        logger.info("Headers: %s", request.headers)
-        logger.info("Body: %s", request.data)
-        data = request.get_json(force=True)
+        if request.content_type.startswith("application/json"):
+            data = request.get_json(force=True)
+        elif request.content_type.startswith("application/x-www-form-urlencoded"):
+            data = request.form.to_dict()
+        else:
+            data = {}
     except Exception as e:
-        logger.error("Ошибка получения JSON: %s", e)
-        return jsonify({'error': -99, 'error_note': 'Неверный JSON'}), 400
+        logger.error("Ошибка получения данных: %s", e)
+        return jsonify({'error': -99, 'error_note': 'Неверный формат данных'}), 400
+
+    if not data:
+        logger.error("Нет данных в запросе")
+        return jsonify({'error': -8, 'error_note': 'Отсутствуют данные'}), 400
 
     required_fields = ['click_trans_id', 'service_id', 'merchant_trans_id', 'amount', 'action', 'sign_time', 'sign_string']
     if not all(field in data for field in required_fields):
@@ -172,7 +180,7 @@ def click_prepare():
         data['sign_time']
     )
     if calc_sign != data['sign_string']:
-        logger.error("PREPARE: SIGN CHECK FAILED! Вычисленная подпись: %s, полученная: %s", calc_sign, data['sign_string'])
+        logger.error("PREPARE: SIGN CHECK FAILED! Вычисленная: %s, полученная: %s", calc_sign, data['sign_string'])
         return jsonify({'error': -1, 'error_note': 'SIGN CHECK FAILED!'}), 400
 
     order = extract_order_by_mti(data['merchant_trans_id'])
@@ -197,14 +205,23 @@ def click_prepare():
 
 @app.route('/click/complete', methods=['POST'])
 def click_complete():
+    logger.info("Запрос COMPLETE получен")
+    logger.info("Headers: %s", request.headers)
+    logger.info("Body: %s", request.data)
     try:
-        logger.info("Запрос COMPLETE получен")
-        logger.info("Headers: %s", request.headers)
-        logger.info("Body: %s", request.data)
-        data = request.get_json(force=True)
+        if request.content_type.startswith("application/json"):
+            data = request.get_json(force=True)
+        elif request.content_type.startswith("application/x-www-form-urlencoded"):
+            data = request.form.to_dict()
+        else:
+            data = {}
     except Exception as e:
-        logger.error("Ошибка получения JSON: %s", e)
-        return jsonify({'error': -99, 'error_note': 'Неверный JSON'}), 400
+        logger.error("Ошибка получения данных: %s", e)
+        return jsonify({'error': -99, 'error_note': 'Неверный формат данных'}), 400
+
+    if not data:
+        logger.error("Нет данных в запросе")
+        return jsonify({'error': -8, 'error_note': 'Отсутствуют данные'}), 400
 
     required_fields = ['click_trans_id', 'service_id', 'merchant_trans_id', 'merchant_prepare_id', 'amount', 'action', 'sign_time', 'sign_string']
     if not all(field in data for field in required_fields):
@@ -222,7 +239,7 @@ def click_complete():
         data['sign_time']
     )
     if calc_sign != data['sign_string']:
-        logger.error("COMPLETE: SIGN CHECK FAILED! Вычисленная подпись: %s, полученная: %s", calc_sign, data['sign_string'])
+        logger.error("COMPLETE: SIGN CHECK FAILED! Вычисленная: %s, полученная: %s", calc_sign, data['sign_string'])
         return jsonify({'error': -1, 'error_note': 'SIGN CHECK FAILED!'}), 400
 
     order = extract_order_by_mti(data['merchant_trans_id'])
