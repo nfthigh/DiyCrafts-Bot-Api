@@ -22,7 +22,7 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# Загрузка переменных окружения
+# Загружаем переменные окружения
 load_dotenv()
 
 logging.basicConfig(
@@ -273,8 +273,6 @@ def build_fiscal_item(order):
         "VATPercent": 12,
         "CommissionInfo": product_info["CommissionInfo"]
     }
-
-# --- Обработчики бота ---
 
 @router.message(Command("start"))
 async def send_welcome(message: types.Message, state: FSMContext):

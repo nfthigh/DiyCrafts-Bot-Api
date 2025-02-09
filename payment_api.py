@@ -28,7 +28,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL не установлена")
 
-# Глобальная переменная для подключения к БД
+# Глобальная переменная подключения к БД
 db_conn = None
 
 def connect_db():
@@ -100,7 +100,7 @@ def build_fiscal_item(order):
         raise ValueError("Некорректные данные заказа для фискализации.")
     unit_price = round(total_price / quantity)
     vat = round((total_price / 1.12) * 0.12)
-    # Пример данных товаров (расширьте по необходимости)
+    # Пример данных товаров – расширьте по необходимости
     products_data = {
         "Кружка": {"SPIC": "06912001036000000", "PackageCode": "1184747", "CommissionInfo": {"TIN": "307022362"}},
         "Брелок": {"SPIC": "07117001015000000", "PackageCode": "1156259", "CommissionInfo": {"TIN": "307022362"}}
@@ -126,31 +126,35 @@ def extract_order_by_mti(merchant_trans_id):
     cursor.execute("SELECT * FROM orders WHERE merchant_trans_id = %s", (merchant_trans_id,))
     return cursor.fetchone()
 
+# Универсальная функция для получения данных запроса (из JSON, form или query string)
+def get_request_data():
+    try:
+        if request.content_type and request.content_type.startswith("application/json"):
+            data = request.get_json(force=True)
+        elif request.content_type and request.content_type.startswith("application/x-www-form-urlencoded"):
+            data = request.form.to_dict()
+        else:
+            data = {}
+        if not data:
+            data = request.args.to_dict()
+        return data
+    except Exception as e:
+        logger.error("Ошибка получения данных: %s", e)
+        return {}
+
 @app.route('/click/prepare', methods=['POST'])
 def click_prepare():
     logger.info("Запрос PREPARE получен")
     logger.info("Headers: %s", request.headers)
     logger.info("Body: %s", request.data)
-    try:
-        if request.content_type.startswith("application/json"):
-            data = request.get_json(force=True)
-        elif request.content_type.startswith("application/x-www-form-urlencoded"):
-            data = request.form.to_dict()
-        else:
-            data = {}
-    except Exception as e:
-        logger.error("Ошибка получения данных: %s", e)
-        return jsonify({'error': -99, 'error_note': 'Неверный формат данных'}), 400
-
+    data = get_request_data()
     if not data:
         logger.error("Нет данных в запросе")
         return jsonify({'error': -8, 'error_note': 'Отсутствуют данные'}), 400
-
     required_fields = ['click_trans_id', 'service_id', 'merchant_trans_id', 'amount', 'action', 'sign_time', 'sign_string']
     if not all(field in data for field in required_fields):
         logger.error("PREPARE: Отсутствуют обязательные параметры. Данные: %s", data)
         return jsonify({'error': -8, 'error_note': 'Отсутствуют обязательные параметры'}), 400
-
     calc_sign = calculate_md5(
         data['click_trans_id'],
         data['service_id'],
@@ -163,18 +167,15 @@ def click_prepare():
     if calc_sign != data['sign_string']:
         logger.error("PREPARE: SIGN CHECK FAILED! Вычисленная: %s, полученная: %s", calc_sign, data['sign_string'])
         return jsonify({'error': -1, 'error_note': 'SIGN CHECK FAILED!'}), 400
-
     order = extract_order_by_mti(data['merchant_trans_id'])
     if not order:
         logger.error("PREPARE: Заказ не найден для merchant_trans_id=%s", data['merchant_trans_id'])
         return jsonify({'error': -5, 'error_note': 'Заказ не найден'}), 200
-
     merchant_prepare_id = int(time.time())
     cursor = get_db_cursor()
     cursor.execute("UPDATE orders SET merchant_prepare_id = %s WHERE merchant_trans_id = %s", (merchant_prepare_id, data['merchant_trans_id']))
-    db_conn.commit()  # Используем db_conn.commit(), а не conn.commit()
+    db_conn.commit()
     logger.info("PREPARE: Обновлён заказ merchant_trans_id=%s, merchant_prepare_id=%s", data['merchant_trans_id'], merchant_prepare_id)
-
     response = {
         'click_trans_id': data['click_trans_id'],
         'merchant_trans_id': data['merchant_trans_id'],
@@ -190,26 +191,14 @@ def click_complete():
     logger.info("Запрос COMPLETE получен")
     logger.info("Headers: %s", request.headers)
     logger.info("Body: %s", request.data)
-    try:
-        if request.content_type.startswith("application/json"):
-            data = request.get_json(force=True)
-        elif request.content_type.startswith("application/x-www-form-urlencoded"):
-            data = request.form.to_dict()
-        else:
-            data = {}
-    except Exception as e:
-        logger.error("Ошибка получения данных: %s", e)
-        return jsonify({'error': -99, 'error_note': 'Неверный формат данных'}), 400
-
+    data = get_request_data()
     if not data:
         logger.error("Нет данных в запросе")
         return jsonify({'error': -8, 'error_note': 'Отсутствуют данные'}), 400
-
     required_fields = ['click_trans_id', 'service_id', 'merchant_trans_id', 'merchant_prepare_id', 'amount', 'action', 'sign_time', 'sign_string']
     if not all(field in data for field in required_fields):
         logger.error("COMPLETE: Отсутствуют обязательные параметры. Данные: %s", data)
         return jsonify({'error': -8, 'error_note': 'Отсутствуют обязательные параметры'}), 400
-
     calc_sign = calculate_md5(
         data['click_trans_id'],
         data['service_id'],
@@ -223,12 +212,17 @@ def click_complete():
     if calc_sign != data['sign_string']:
         logger.error("COMPLETE: SIGN CHECK FAILED! Вычисленная: %s, полученная: %s", calc_sign, data['sign_string'])
         return jsonify({'error': -1, 'error_note': 'SIGN CHECK FAILED!'}), 400
-
     order = extract_order_by_mti(data['merchant_trans_id'])
-    if not order or order.get("merchant_prepare_id") != data['merchant_prepare_id']:
+    # Приводим оба значения к int для сравнения
+    try:
+        db_prepare = int(order.get("merchant_prepare_id"))
+        req_prepare = int(data['merchant_prepare_id'])
+    except Exception as e:
+        logger.error("Ошибка преобразования merchant_prepare_id: %s", e)
+        return jsonify({'error': -2, 'error_note': 'Invalid merchant_prepare_id format'}), 400
+    if not order or db_prepare != req_prepare:
         logger.error("COMPLETE: Заказ не найден или merchant_prepare_id не совпадает для merchant_trans_id=%s", data['merchant_trans_id'])
         return jsonify({'error': -6, 'error_note': 'Transaction does not exist'}), 200
-
     cursor = get_db_cursor()
     cursor.execute("UPDATE orders SET status = %s WHERE merchant_trans_id = %s", ("paid", data['merchant_trans_id']))
     db_conn.commit()
