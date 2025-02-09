@@ -24,7 +24,7 @@ from psycopg2.extras import RealDictCursor
 # Загрузка переменных окружения
 load_dotenv()
 
-# Настройка логирования
+# Настройка логирования (логи выводятся в stdout, которые видны на Render)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -32,19 +32,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Получение переменных из .env
+# Получаем переменные из .env
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not API_TOKEN:
     raise Exception("TELEGRAM_BOT_TOKEN не определён в .env")
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL не определена")
-
 MERCHANT_USER_ID = os.getenv("MERCHANT_USER_ID")
 SECRET_KEY = os.getenv("SECRET_KEY")
 SERVICE_ID = os.getenv("SERVICE_ID")
-# Если потребуется MERCHANT_ID (для формирования ссылок, если нужно)
 MERCHANT_ID = os.getenv("MERCHANT_ID")
 
 ADMIN_CHAT_IDS = os.getenv("ADMIN_CHAT_IDS")
@@ -55,7 +52,7 @@ else:
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 SELF_URL = os.getenv("SELF_URL")
 
-# Подключение к PostgreSQL
+# Подключаемся к PostgreSQL
 try:
     db_conn = psycopg2.connect(DATABASE_URL, sslmode='require')
     db_conn.autocommit = True
@@ -65,7 +62,7 @@ except Exception as e:
     logger.error("Ошибка подключения к PostgreSQL (бот): %s", e)
     raise
 
-# Создание таблиц (если их нет)
+# Создаем таблицы, если их нет
 create_clients_table = """
 CREATE TABLE IF NOT EXISTS clients (
     user_id BIGINT PRIMARY KEY,
@@ -98,7 +95,7 @@ except Exception as e:
     logger.error("Ошибка создания таблиц (бот): %s", e)
     raise
 
-# Автоматическое добавление необходимых столбцов
+# Автоматически добавляем недостающие столбцы
 try:
     db_cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_amount INTEGER;")
     db_cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS merchant_prepare_id BIGINT;")
@@ -155,7 +152,7 @@ def get_product_keyboard():
     builder.adjust(2)
     return builder.as_markup()
 
-# Функция генерации заголовка для Click API
+# Функция генерации заголовка для Click API (для создания инвойса)
 def generate_auth_header():
     timestamp = str(int(time.time()))
     digest = hashlib.sha1((timestamp + SECRET_KEY).encode('utf-8')).hexdigest()
@@ -183,7 +180,7 @@ def create_invoice(amount, phone_number, merchant_trans_id):
         logger.error("Ошибка запроса к Click API: %s", e)
         return {"error_code": -99, "error_note": "Ошибка запроса к Click API"}
 
-# Каталог товаров (для формирования фискальных данных)
+# Каталог товаров для формирования фискальных данных (пример)
 products_data = {
     "Кружка": {
         "SPIC": "06912001036000000",
@@ -232,17 +229,8 @@ products_data = {
     }
 }
 
-# Функция формирования позиции для фискализации
+# Функция формирования позиции для фискализации (пример)
 def build_fiscal_item(order):
-    """
-    Формирует позицию для фискализации на основе данных заказа.
-    Ожидается, что order содержит:
-      - product (название товара),
-      - quantity (количество),
-      - payment_amount (общая сумма заказа).
-    Цена за единицу = payment_amount / quantity.
-    НДС = round((total_price / 1.12) * 0.12)
-    """
     product = order.get("product")
     quantity = order.get("quantity")
     total_price = order.get("payment_amount")
@@ -253,7 +241,7 @@ def build_fiscal_item(order):
     product_info = products_data.get(product)
     if not product_info:
         raise ValueError(f"Нет данных для товара '{product}'.")
-    fiscal_item = {
+    return {
         "Name": f"{product} (шт)",
         "SPIC": product_info["SPIC"],
         "Units": 1,
@@ -265,7 +253,6 @@ def build_fiscal_item(order):
         "VATPercent": 12,
         "CommissionInfo": product_info["CommissionInfo"]
     }
-    return fiscal_item
 
 # Инициализация бота
 bot = Bot(
@@ -281,7 +268,7 @@ dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-# --- Обработчики команд и регистрации ---
+# --- Обработчики команд и регистрация ---
 
 @router.message(Command("start"))
 async def send_welcome(message: types.Message, state: FSMContext):
@@ -524,10 +511,21 @@ async def process_payment_sum(message: types.Message, state: FSMContext):
     invoice_response = create_invoice(int(payment_sum), phone_number, merchant_trans_id)
     if invoice_response.get("error_code") == 0:
         invoice_id = invoice_response.get("invoice_id")
-        # Формируем ссылку для оплаты согласно документации:
-        payment_url = f"https://api.click.uz/v2/merchant/invoice/status/{SERVICE_ID}/{invoice_id}"
+        # Формирование публичной ссылки для оплаты по заданной схеме:
+        # https://my.click.uz/services/pay?service_id=<service_id>&merchant_id=<merchant_id>&amount=<amount>&transaction_param=<merchant_trans_id>&return_url=<return_url>&signature=<signature>
+        action = "0"
+        sign_time = time.strftime("%Y-%m-%d %H:%M:%S")
+        signature_string = f"{merchant_trans_id}{SERVICE_ID}{SECRET_KEY}{payment_sum}{action}{sign_time}"
+        signature = hashlib.md5(signature_string.encode('utf-8')).hexdigest()
+        RETURN_URL = os.getenv("RETURN_URL")
+        payment_url = (
+            f"https://my.click.uz/services/pay?"
+            f"service_id={SERVICE_ID}&merchant_id={MERCHANT_ID}&amount={payment_sum}"
+            f"&transaction_param={merchant_trans_id}&return_url={RETURN_URL}&signature={signature}"
+        )
         try:
-            await bot.send_message(order["user_id"], f"✅ Ваш заказ №{order_id} одобрен!\nСумма: {payment_sum} сум.\nОплатите по ссылке:\n{payment_url}")
+            await bot.send_message(order["user_id"],
+                                   f"✅ Ваш заказ №{order_id} одобрен!\nСумма: {payment_sum} сум.\nОплатите по ссылке:\n{payment_url}")
             await message.reply("Инвойс создан, ссылка отправлена клиенту.")
         except Exception as e:
             logger.error(f"Ошибка отправки ссылки клиенту: {e}")

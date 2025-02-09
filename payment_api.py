@@ -11,7 +11,7 @@ import sys
 # Загрузка переменных окружения
 load_dotenv()
 
-# Настройка логирования
+# Настройка логирования (stdout – логи видны на Render)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -28,7 +28,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL не установлена")
 
-# Подключаемся к базе данных PostgreSQL
+# Подключаемся к PostgreSQL
 try:
     conn = psycopg2.connect(DATABASE_URL, sslmode='require')
     conn.autocommit = True
@@ -38,7 +38,7 @@ except Exception as e:
     logger.error("Ошибка подключения к БД (payment_api): %s", e)
     raise
 
-# Обновляем схему: создаём таблицу orders, если её нет, и добавляем столбец merchant_prepare_id
+# Обновляем схему: создаем таблицу orders, если её нет, и добавляем столбец merchant_prepare_id
 try:
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS orders (
@@ -62,7 +62,7 @@ try:
 except Exception as e:
     logger.error("Ошибка обновления схемы базы данных: %s", e)
 
-# Каталог товаров для формирования фискальных данных
+# Каталог товаров для формирования фискальных данных (пример)
 products_data = {
     "Кружка": {
         "SPIC": "06912001036000000",
@@ -116,15 +116,6 @@ def calculate_md5(*args):
     return hashlib.md5(concat_str.encode('utf-8')).hexdigest()
 
 def build_fiscal_item(order):
-    """
-    Формирует позицию для фискализации.
-    Ожидается, что order содержит:
-      - product: название товара,
-      - quantity: количество,
-      - payment_amount: общая сумма заказа.
-    Цена за единицу = payment_amount / quantity.
-    НДС = round((total_price / 1.12) * 0.12)
-    """
     product = order.get("product")
     quantity = order.get("quantity")
     total_price = order.get("payment_amount")
@@ -135,7 +126,7 @@ def build_fiscal_item(order):
     product_info = products_data.get(product)
     if not product_info:
         raise ValueError(f"Нет данных для товара '{product}'.")
-    fiscal_item = {
+    return {
         "Name": f"{product} (шт)",
         "SPIC": product_info["SPIC"],
         "Units": 1,
@@ -147,12 +138,8 @@ def build_fiscal_item(order):
         "VATPercent": 12,
         "CommissionInfo": product_info["CommissionInfo"]
     }
-    return fiscal_item
 
 def extract_order_id(merchant_trans_id):
-    """
-    Из merchant_trans_id вида "order_{order_id}" извлекает order_id.
-    """
     if not merchant_trans_id.startswith("order_"):
         return None
     try:
