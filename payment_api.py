@@ -1,279 +1,264 @@
-# payment_api.py
 import os
-import sys
-import logging
-import time
 import hashlib
-import json
-import requests
-import threading
-import psycopg2
+import time
 from flask import Flask, request, jsonify
-import config
+from dotenv import load_dotenv
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import logging
+import sys
 
-# Настроим логирование в консоль (stdout)
+load_dotenv()
+
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
     stream=sys.stdout
 )
-logger = logging.getLogger("payment_api")
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.logger = logger
 
-# Функция для подключения к базе PostgreSQL
-def get_db_connection():
-    return psycopg2.connect(config.DATABASE_URL)
+MERCHANT_USER_ID = os.getenv("MERCHANT_USER_ID")
+SECRET_KEY = os.getenv("SECRET_KEY")
+SERVICE_ID = os.getenv("SERVICE_ID")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise Exception("DATABASE_URL не установлена")
 
-# Функция генерации заголовка аутентификации
-def generate_auth_header():
-    timestamp = str(int(time.time()))
-    digest = hashlib.sha1((timestamp + config.SECRET_KEY).encode('utf-8')).hexdigest()
-    header = f"{config.MERCHANT_USER_ID}:{digest}:{timestamp}"
-    app.logger.info("Сгенерирован auth header: %s", header)
-    return header
+# Подключаемся к PostgreSQL
+try:
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    conn.autocommit = True
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    logger.info("Подключение к PostgreSQL выполнено успешно (server).")
+except Exception as e:
+    logger.error("Ошибка подключения к БД (server): %s", e)
+    raise
 
-# Функция уведомления администраторов через Telegram
-def notify_admins(message_text):
-    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": config.GROUP_CHAT_ID, "text": message_text, "parse_mode": "HTML"}
-    try:
-        requests.post(url, data=payload, timeout=10)
-        app.logger.info("Уведомление отправлено: %s", message_text)
-    except Exception as e:
-        app.logger.error("Ошибка отправки уведомления в Telegram: %s", e)
+# Добавляем необходимые столбцы, если их нет
+try:
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            order_id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            product TEXT,
+            quantity INTEGER,
+            design_text TEXT,
+            design_photo TEXT,
+            location_lat REAL,
+            location_lon REAL,
+            status TEXT,
+            payment_amount INTEGER,
+            order_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            delivery_comment TEXT
+        )
+    """)
+    cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS merchant_prepare_id BIGINT;")
+    conn.commit()
+    logger.info("Схема базы данных обновлена (orders).")
+except Exception as e:
+    logger.error("Ошибка обновления схемы базы данных: %s", e)
 
-@app.route("/click-api/create_invoice", methods=["POST"])
-def create_invoice():
-    app.logger.info("Получен запрос на создание инвойса: %s", request.data.decode())
-    data = request.get_json() or request.form
-    app.logger.info("Данные запроса: %s", data)
-
-    required_fields = ["merchant_trans_id", "amount", "phone_number"]
-    for field in required_fields:
-        if field not in data:
-            error_msg = f"Missing field: {field}"
-            app.logger.error(error_msg)
-            return jsonify({"error": "-8", "error_note": error_msg}), 400
-
-    merchant_trans_id = data["merchant_trans_id"]
-    try:
-        amount = float(data["amount"])
-    except Exception as e:
-        error_msg = f"Ошибка преобразования amount: {e}"
-        app.logger.error(error_msg)
-        return jsonify({"error": "-8", "error_note": error_msg}), 400
-    phone_number = data["phone_number"]
-
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Auth": generate_auth_header(),
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "en-US,en;q=0.9"
-    }
-    payload = {
-        "service_id": config.SERVICE_ID,
-        "amount": amount,
-        "phone_number": phone_number,
-        "merchant_trans_id": merchant_trans_id
-    }
-    app.logger.info("Payload для создания инвойса: %s", json.dumps(payload, indent=2))
-    try:
-        resp = requests.post("https://api.click.uz/v2/merchant/invoice/create",
-                             headers=headers,
-                             json=payload,
-                             timeout=30)
-        app.logger.info("HTTP-статус создания инвойса: %s", resp.status_code)
-        if resp.status_code != 200:
-            app.logger.error("Invoice creation failed: %s", resp.text)
-            return jsonify({
-                "error": "-9",
-                "error_note": "Invoice creation failed",
-                "http_code": resp.status_code,
-                "response": resp.text
-            }), 200
-        invoice_data = resp.json()
-        app.logger.info("Invoice created: %s", json.dumps(invoice_data, indent=2))
-        return jsonify(invoice_data), 200
-    except Exception as e:
-        app.logger.error("Invoice creation exception: %s", str(e))
-        return jsonify({"error": "-9", "error_note": str(e)}), 200
-
-@app.route("/click-api/prepare", methods=["POST"])
-def prepare():
-    app.logger.info("Получен запрос на prepare: %s", request.data.decode())
-    required_fields = ["click_trans_id", "merchant_trans_id", "amount"]
-    for field in required_fields:
-        if field not in request.form:
-            error_msg = f"Missing field: {field}"
-            app.logger.error(error_msg)
-            return jsonify({"error": "-8", "error_note": error_msg}), 400
-
-    click_trans_id = request.form["click_trans_id"]
-    merchant_trans_id = request.form["merchant_trans_id"]
-    app.logger.info("Prepare: click_trans_id=%s, merchant_trans_id=%s", click_trans_id, merchant_trans_id)
-    
-    conn_db = get_db_connection()
-    cursor_db = conn_db.cursor()
-    # Обновляем запись, если она существует, или создаём новую
-    cursor_db.execute("UPDATE orders SET status=%s, cost_info=%s WHERE merchant_trans_id=%s",
-                      ("pending", click_trans_id, merchant_trans_id))
-    if cursor_db.rowcount == 0:
-        cursor_db.execute("INSERT INTO orders (merchant_trans_id, status, cost_info) VALUES (%s, %s, %s)",
-                          (merchant_trans_id, "pending", click_trans_id))
-        app.logger.info("Новый заказ создан в режиме prepare.")
-    else:
-        app.logger.info("Заказ обновлён в режиме prepare.")
-    conn_db.commit()
-    cursor_db.close()
-    conn_db.close()
-    
-    response = {
-        "click_trans_id": click_trans_id,
-        "merchant_trans_id": merchant_trans_id,
-        "merchant_prepare_id": merchant_trans_id,
-        "error": "0",
-        "error_note": "Success"
-    }
-    app.logger.info("Ответ prepare: %s", json.dumps(response, indent=2))
-    return jsonify(response)
-
-@app.route("/click-api/complete", methods=["POST"])
-def complete():
-    app.logger.info("Получен запрос на complete: %s", request.data.decode())
-    required_fields = ["click_trans_id", "merchant_trans_id", "merchant_prepare_id", "amount"]
-    for field in required_fields:
-        if field not in request.form:
-            error_msg = f"Missing field: {field}"
-            app.logger.error(error_msg)
-            return jsonify({"error": "-8", "error_note": error_msg}), 400
-
-    click_trans_id = request.form["click_trans_id"]
-    merchant_trans_id = request.form["merchant_trans_id"]
-    merchant_prepare_id = request.form["merchant_prepare_id"]
-    try:
-        amount = float(request.form["amount"])
-    except Exception as e:
-        error_msg = f"Ошибка преобразования amount: {e}"
-        app.logger.error(error_msg)
-        return jsonify({"error": "-8", "error_note": error_msg}), 400
-
-    # Подключаемся к базе PostgreSQL
-    conn_db = get_db_connection()
-    cursor_db = conn_db.cursor()
-    cursor_db.execute("SELECT admin_price, unit_price, product FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
-    row = cursor_db.fetchone()
-    if row and row[0] is not None and row[1] is not None:
-        admin_price = float(row[0])
-        unit_price = float(row[1])
-        product_name = row[2] if row[2] else "Неизвестный товар"
-        app.logger.info("Получены admin_price=%s, unit_price=%s, product_name=%s", admin_price, unit_price, product_name)
-    else:
-        cursor_db.close()
-        conn_db.close()
-        return jsonify({"error": "-8", "error_note": "Цена заказа не установлена. Пожалуйста, дождитесь подтверждения администратора."}), 400
-
-    # Для фискализации фиксируем количество равным 1
-    fiscal_quantity = 1
-
-    # Продолжаем логику: проверяем, что заказ существует и ещё не оплачен
-    cursor_db.execute("SELECT * FROM orders WHERE merchant_trans_id=%s", (merchant_trans_id,))
-    order_row = cursor_db.fetchone()
-    if not order_row:
-        cursor_db.close()
-        conn_db.close()
-        return jsonify({"error": "-5", "error_note": "Order not found"}), 404
-    # Предположим, что поле is_paid находится в конце строки заказа
-    if order_row[-1] == True:
-        cursor_db.close()
-        conn_db.close()
-        return jsonify({"error": "-4", "error_note": "Already paid"}), 400
-
-    cursor_db.execute("UPDATE orders SET is_paid=%s, status=%s WHERE merchant_trans_id=%s",
-                      (True, "processing", merchant_trans_id))
-    conn_db.commit()
-
-    # Пример формирования фискального элемента (здесь ваша логика)
-    # Для демонстрации просто формируем словарь с данными
-    fiscal_item = {
-        "Name": product_name,
-        "GoodPrice": unit_price,  # unit_price в тийинах
-        "Price": unit_price * fiscal_quantity,
-        "Amount": fiscal_quantity,
-        "VAT": round((unit_price * fiscal_quantity / 1.12) * 0.12),
-        "VATPercent": 12,
+# Каталог товаров для фискализации
+products_data = {
+    "Кружка": {
+        "SPIC": "06912001036000000",
+        "PackageCode": "1184747",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Брелок": {
+        "SPIC": "07117001015000000",
+        "PackageCode": "1156259",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Кепка": {
+        "SPIC": "06506001022000000",
+        "PackageCode": "1324746",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Визитка": {
+        "SPIC": "04911001003000000",
+        "PackageCode": "1156221",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Футболка": {
+        "SPIC": "06109001001000000",
+        "PackageCode": "1124331",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Худи": {
+        "SPIC": "06212001012000000",
+        "PackageCode": "1238867",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Пазл": {
+        "SPIC": "04811001019000000",
+        "PackageCode": "1748791",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Камень": {
+        "SPIC": "04911001017000000",
+        "PackageCode": "1156234",
+        "CommissionInfo": {"TIN": "307022362"}
+    },
+    "Стакан": {
+        "SPIC": "07013001008000000",
+        "PackageCode": "1345854",
         "CommissionInfo": {"TIN": "307022362"}
     }
-    fiscal_items = [fiscal_item]
-    app.logger.info("Фискальные данные сформированы: %s", json.dumps(fiscal_items, indent=2, ensure_ascii=False))
+}
 
-    # Отправка фискальных данных (пример запроса к внешнему API)
-    fiscal_headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Auth": generate_auth_header(),
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "en-US,en;q=0.9"
+def calculate_md5(*args):
+    concat_str = ''.join(str(arg) for arg in args)
+    return hashlib.md5(concat_str.encode('utf-8')).hexdigest()
+
+def build_fiscal_item(order):
+    """
+    Формирует позицию для фискализации.
+    Ожидается, что order содержит:
+      - product: название товара,
+      - quantity: количество,
+      - payment_amount: общая сумма заказа.
+    Цена за единицу = payment_amount / quantity.
+    НДС = round((total_price / 1.12) * 0.12)
+    """
+    product = order.get("product")
+    quantity = order.get("quantity")
+    total_price = order.get("payment_amount")
+    if not total_price or not quantity:
+        raise ValueError("Некорректные данные заказа для фискализации.")
+    unit_price = round(total_price / quantity)
+    vat = round((total_price / 1.12) * 0.12)
+    product_info = products_data.get(product)
+    if not product_info:
+        raise ValueError(f"Нет данных для товара '{product}'.")
+    fiscal_item = {
+        "Name": f"{product} (шт)",
+        "SPIC": product_info["SPIC"],
+        "Units": 1,
+        "PackageCode": product_info["PackageCode"],
+        "GoodPrice": unit_price,
+        "Price": total_price,
+        "Amount": quantity,
+        "VAT": vat,
+        "VATPercent": 12,
+        "CommissionInfo": product_info["CommissionInfo"]
     }
-    fiscal_payload = {
-        "service_id": config.SERVICE_ID,
-        "payment_id": click_trans_id,
-        "items": fiscal_items,
-        "received_ecash": amount,
-        "received_cash": 0,
-        "received_card": 0
-    }
-    app.logger.info("Фискальный payload: %s", json.dumps(fiscal_payload, indent=2, ensure_ascii=False))
+    return fiscal_item
+
+def extract_order_id(merchant_trans_id):
+    """
+    Из merchant_trans_id вида "order_{order_id}" извлекает order_id.
+    """
+    if not merchant_trans_id.startswith("order_"):
+        return None
     try:
-        resp_fiscal = requests.post("https://api.click.uz/v2/merchant/payment/ofd_data/submit_items",
-                                      headers=fiscal_headers,
-                                      json=fiscal_payload,
-                                      timeout=30)
-        if resp_fiscal.status_code == 200:
-            fiscal_result = resp_fiscal.json()
-            app.logger.info("Фискальные данные отправлены, ответ: %s", json.dumps(fiscal_result, indent=2, ensure_ascii=False))
-        else:
-            fiscal_result = {"error_code": -1, "raw": resp_fiscal.text}
-            app.logger.error("Ошибка фискализации, статус %s: %s", resp_fiscal.status_code, resp_fiscal.text)
-    except Exception as e:
-        fiscal_result = {"error_code": -1, "error_note": str(e)}
-        app.logger.error("Исключение при фискализации: %s", e)
+        return int(merchant_trans_id.split("_")[1])
+    except Exception:
+        return None
 
-    cursor_db.execute("UPDATE orders SET status=%s WHERE merchant_trans_id=%s", ("completed", merchant_trans_id))
-    conn_db.commit()
-    cursor_db.close()
-    conn_db.close()
+@app.route('/click/prepare', methods=['POST'])
+def click_prepare():
+    data = request.get_json()
+    logger.info("Получен запрос PREPARE: %s", data)
+    required_fields = ['click_trans_id', 'service_id', 'merchant_trans_id', 'amount', 'action', 'sign_time', 'sign_string']
+    if not all(field in data for field in required_fields):
+        logger.error("PREPARE: Отсутствуют обязательные параметры")
+        return jsonify({'error': -8, 'error_note': 'Отсутствуют обязательные параметры'}), 400
+
+    calc_sign = calculate_md5(
+        data['click_trans_id'],
+        data['service_id'],
+        SECRET_KEY,
+        data['merchant_trans_id'],
+        data['amount'],
+        data['action'],
+        data['sign_time']
+    )
+    if calc_sign != data['sign_string']:
+        logger.error("PREPARE: SIGN CHECK FAILED!")
+        return jsonify({'error': -1, 'error_note': 'SIGN CHECK FAILED!'}), 400
+
+    order_id = extract_order_id(data['merchant_trans_id'])
+    if not order_id:
+        logger.error("PREPARE: Некорректный merchant_trans_id")
+        return jsonify({'error': -5, 'error_note': 'Некорректный merchant_trans_id'}), 200
+
+    cursor.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
+    order = cursor.fetchone()
+    if not order:
+        logger.error("PREPARE: Заказ не найден для order_id=%s", order_id)
+        return jsonify({'error': -5, 'error_note': 'Заказ не найден'}), 200
+
+    merchant_prepare_id = int(time.time())
+    cursor.execute("UPDATE orders SET merchant_prepare_id = %s WHERE order_id = %s", (merchant_prepare_id, order_id))
+    conn.commit()
+    logger.info("PREPARE: Обновлён заказ %s с merchant_prepare_id=%s", order_id, merchant_prepare_id)
 
     response = {
-        "click_trans_id": click_trans_id,
-        "merchant_trans_id": merchant_trans_id,
-        "merchant_confirm_id": merchant_prepare_id,
-        "error": "0",
-        "error_note": "Success",
-        "fiscal_items": fiscal_items,
-        "fiscal_response": fiscal_result
+        'click_trans_id': data['click_trans_id'],
+        'merchant_trans_id': data['merchant_trans_id'],
+        'merchant_prepare_id': merchant_prepare_id,
+        'error': 0,
+        'error_note': 'Success'
     }
-    app.logger.info("Ответ /complete отправлен: %s", json.dumps(response, indent=2, ensure_ascii=False))
-    return jsonify(response)
+    logger.info("PREPARE: Ответ: %s", response)
+    return jsonify(response), 200
 
-def auto_ping():
-    """
-    Функция автопинга для поддержания активности приложения.
-    Каждые 4 минуты отправляет GET-запрос к SELF_URL.
-    """
-    while True:
-        try:
-            app.logger.info("Auto-ping: отправка запроса к %s", config.SELF_URL)
-            requests.get(config.SELF_URL, timeout=10)
-        except Exception as e:
-            app.logger.error("Auto-ping error: %s", e)
-        time.sleep(240)
+@app.route('/click/complete', methods=['POST'])
+def click_complete():
+    data = request.get_json()
+    logger.info("Получен запрос COMPLETE: %s", data)
+    required_fields = ['click_trans_id', 'service_id', 'merchant_trans_id', 'merchant_prepare_id', 'amount', 'action', 'sign_time', 'sign_string']
+    if not all(field in data for field in required_fields):
+        logger.error("COMPLETE: Отсутствуют обязательные параметры")
+        return jsonify({'error': -8, 'error_note': 'Отсутствуют обязательные параметры'}), 400
 
-# Запускаем автопинг в отдельном потоке
-ping_thread = threading.Thread(target=auto_ping, daemon=True)
-ping_thread.start()
+    calc_sign = calculate_md5(
+        data['click_trans_id'],
+        data['service_id'],
+        SECRET_KEY,
+        data['merchant_trans_id'],
+        data['merchant_prepare_id'],
+        data['amount'],
+        data['action'],
+        data['sign_time']
+    )
+    if calc_sign != data['sign_string']:
+        logger.error("COMPLETE: SIGN CHECK FAILED!")
+        return jsonify({'error': -1, 'error_note': 'SIGN CHECK FAILED!'}), 400
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+    order_id = extract_order_id(data['merchant_trans_id'])
+    if not order_id:
+        logger.error("COMPLETE: Некорректный merchant_trans_id")
+        return jsonify({'error': -5, 'error_note': 'Некорректный merchant_trans_id'}), 200
+
+    cursor.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
+    order = cursor.fetchone()
+    if not order or order.get("merchant_prepare_id") != data['merchant_prepare_id']:
+        logger.error("COMPLETE: Заказ не найден или merchant_prepare_id не совпадает для order_id=%s", order_id)
+        return jsonify({'error': -6, 'error_note': 'Transaction does not exist'}), 200
+
+    cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("paid", order_id))
+    conn.commit()
+    try:
+        fiscal_item = build_fiscal_item(order)
+    except Exception as e:
+        logger.error("COMPLETE: Ошибка формирования фискальных данных: %s", e)
+        fiscal_item = {}
+    merchant_confirm_id = int(time.time())
+    response = {
+        'click_trans_id': data['click_trans_id'],
+        'merchant_trans_id': data['merchant_trans_id'],
+        'merchant_confirm_id': merchant_confirm_id,
+        'fiscal_items': fiscal_item,
+        'error': 0,
+        'error_note': 'Success'
+    }
+    logger.info("COMPLETE: Ответ: %s", response)
+    return jsonify(response), 200
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
