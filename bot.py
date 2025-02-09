@@ -16,7 +16,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
 import psycopg2
@@ -25,6 +25,7 @@ from psycopg2.extras import RealDictCursor
 # Загружаем переменные окружения
 load_dotenv()
 
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -60,6 +61,7 @@ except Exception as e:
     logger.error("Ошибка подключения к PostgreSQL (бот): %s", e)
     raise
 
+# Создаем таблицы, если их нет
 create_clients_table = """
 CREATE TABLE IF NOT EXISTS clients (
     user_id BIGINT PRIMARY KEY,
@@ -127,7 +129,7 @@ class OrderForm(StatesGroup):
     location = State()
     delivery_comment = State()
 
-# FSM для управления БД (админ)
+# FSM для управления базой (админ)
 class DBManagementState(StatesGroup):
     waiting_for_client_id = State()
     waiting_for_order_id = State()
@@ -197,7 +199,7 @@ async def create_payment_link(user_id: int, amount: int, merchant_trans_id: str)
     signature = hashlib.md5(signature_string.encode()).hexdigest()
     payment_url = (
         f"https://my.click.uz/services/pay?"
-        f"service_id={SERVICE_ID}&merchant_id={MERCHANT_ID}&amount={amount}"
+        f"service_id={SERVICE_ID}&merchant_id={MERCHANT_ID}&amount={amount:.2f}"
         f"&transaction_param={merchant_trans_id}&return_url={RETURN_URL}&signature={signature}"
     )
     return payment_url
@@ -475,7 +477,6 @@ async def approve_order(callback_query: types.CallbackQuery, state: FSMContext):
     if admin_id not in ADMIN_CHAT_IDS:
         await callback_query.answer("Нет прав.", show_alert=True)
         return
-    # Обновляем статус заказа
     cur = db_conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Одобрен", order_id))
     db_conn.commit()
@@ -509,7 +510,7 @@ async def process_payment_sum(message: types.Message, state: FSMContext):
         builder = InlineKeyboardBuilder()
         builder.button(text="✅ Подтвердить заказ", callback_data=f"confirm_order_{order_id}")
         await bot.send_message(client_id,
-                               f"Ваш заказ №{order_id} одобрен с ценой {payment_sum} сум.\nПодтвердите заказ, чтобы получить ссылку на оплату:",
+                               f"Ваш заказ №{order_id} одобрен с ценой {payment_sum} сум.\nНажмите кнопку ниже для оплаты:",
                                reply_markup=builder.as_markup())
     await state.clear()
 
@@ -536,7 +537,9 @@ async def handle_client_confirmation(callback_query: types.CallbackQuery, state:
     if not payment_url:
         await callback_query.message.answer("Ошибка при создании ссылки на оплату.")
         return
-    await callback_query.message.answer(f"Ваша ссылка на оплату: {payment_url}")
+    # Формируем inline-клавиатуру с кнопкой "Оплатить"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Оплатить", url=payment_url)]])
+    await callback_query.message.answer("Нажмите кнопку ниже для оплаты:", reply_markup=keyboard)
 
 @router.callback_query(lambda c: c.data and c.data.startswith("reject_"))
 async def reject_order(callback_query: types.CallbackQuery):

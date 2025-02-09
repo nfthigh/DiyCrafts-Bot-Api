@@ -213,7 +213,7 @@ def click_complete():
         logger.error("COMPLETE: SIGN CHECK FAILED! Вычисленная: %s, полученная: %s", calc_sign, data['sign_string'])
         return jsonify({'error': -1, 'error_note': 'SIGN CHECK FAILED!'}), 400
     order = extract_order_by_mti(data['merchant_trans_id'])
-    # Приводим оба значения к int для сравнения
+    # Приводим оба значения к int для сравненияя
     try:
         db_prepare = int(order.get("merchant_prepare_id"))
         req_prepare = int(data['merchant_prepare_id'])
