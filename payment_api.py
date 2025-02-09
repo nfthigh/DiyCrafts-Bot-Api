@@ -8,6 +8,7 @@ from psycopg2.extras import RealDictCursor
 import logging
 import sys
 
+# Загрузка переменных окружения
 load_dotenv()
 
 # Настройка логирования
@@ -27,17 +28,17 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL не установлена")
 
-# Подключаемся к PostgreSQL
+# Подключаемся к базе данных PostgreSQL
 try:
     conn = psycopg2.connect(DATABASE_URL, sslmode='require')
     conn.autocommit = True
     cursor = conn.cursor(cursor_factory=RealDictCursor)
-    logger.info("Подключение к PostgreSQL выполнено успешно (server).")
+    logger.info("Подключение к PostgreSQL выполнено успешно (payment_api).")
 except Exception as e:
-    logger.error("Ошибка подключения к БД (server): %s", e)
+    logger.error("Ошибка подключения к БД (payment_api): %s", e)
     raise
 
-# Добавляем необходимые столбцы, если их нет
+# Обновляем схему: создаём таблицу orders, если её нет, и добавляем столбец merchant_prepare_id
 try:
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS orders (
@@ -61,7 +62,7 @@ try:
 except Exception as e:
     logger.error("Ошибка обновления схемы базы данных: %s", e)
 
-# Каталог товаров для фискализации
+# Каталог товаров для формирования фискальных данных
 products_data = {
     "Кружка": {
         "SPIC": "06912001036000000",

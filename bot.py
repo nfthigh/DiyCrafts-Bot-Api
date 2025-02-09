@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Получаем переменные окружения
+# Получение переменных из .env
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not API_TOKEN:
     raise Exception("TELEGRAM_BOT_TOKEN не определён в .env")
@@ -44,17 +44,18 @@ if not DATABASE_URL:
 MERCHANT_USER_ID = os.getenv("MERCHANT_USER_ID")
 SECRET_KEY = os.getenv("SECRET_KEY")
 SERVICE_ID = os.getenv("SERVICE_ID")
+# Если потребуется MERCHANT_ID (для формирования ссылок, если нужно)
+MERCHANT_ID = os.getenv("MERCHANT_ID")
 
 ADMIN_CHAT_IDS = os.getenv("ADMIN_CHAT_IDS")
 if ADMIN_CHAT_IDS:
     ADMIN_CHAT_IDS = [int(x.strip()) for x in ADMIN_CHAT_IDS.split(",") if x.strip()]
 else:
     ADMIN_CHAT_IDS = []
-
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 SELF_URL = os.getenv("SELF_URL")
 
-# Подключаемся к PostgreSQL
+# Подключение к PostgreSQL
 try:
     db_conn = psycopg2.connect(DATABASE_URL, sslmode='require')
     db_conn.autocommit = True
@@ -64,7 +65,7 @@ except Exception as e:
     logger.error("Ошибка подключения к PostgreSQL (бот): %s", e)
     raise
 
-# Создание таблиц, если их нет
+# Создание таблиц (если их нет)
 create_clients_table = """
 CREATE TABLE IF NOT EXISTS clients (
     user_id BIGINT PRIMARY KEY,
@@ -97,7 +98,7 @@ except Exception as e:
     logger.error("Ошибка создания таблиц (бот): %s", e)
     raise
 
-# Автоматическое добавление столбцов (если их нет)
+# Автоматическое добавление необходимых столбцов
 try:
     db_cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_amount INTEGER;")
     db_cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS merchant_prepare_id BIGINT;")
@@ -122,7 +123,7 @@ class DBManagementState(StatesGroup):
     waiting_for_client_id = State()
     waiting_for_order_id = State()
 
-# FSM для ввода суммы оплаты (админ)
+# FSM для ввода суммы оплаты (при одобрении заказа)
 class OrderApproval(StatesGroup):
     waiting_for_payment_sum = State()
 
@@ -154,13 +155,13 @@ def get_product_keyboard():
     builder.adjust(2)
     return builder.as_markup()
 
-# Функция для генерации заголовка для Click API
+# Функция генерации заголовка для Click API
 def generate_auth_header():
     timestamp = str(int(time.time()))
     digest = hashlib.sha1((timestamp + SECRET_KEY).encode('utf-8')).hexdigest()
     return f"{MERCHANT_USER_ID}:{digest}:{timestamp}"
 
-# Функция для вызова Click API (создание инвойса)
+# Функция вызова Click API для создания инвойса
 def create_invoice(amount, phone_number, merchant_trans_id):
     url = "https://api.click.uz/v2/merchant/invoice/create"
     headers = {
@@ -182,7 +183,7 @@ def create_invoice(amount, phone_number, merchant_trans_id):
         logger.error("Ошибка запроса к Click API: %s", e)
         return {"error_code": -99, "error_note": "Ошибка запроса к Click API"}
 
-# Каталог товаров для формирования фискальных данных (хранится в боте)
+# Каталог товаров (для формирования фискальных данных)
 products_data = {
     "Кружка": {
         "SPIC": "06912001036000000",
@@ -455,6 +456,7 @@ async def send_order_to_admin(user_id, state: FSMContext):
         await bot.send_message(user_id, "🚫 Ошибка при создании заказа.")
         return
 
+    # Формируем merchant_trans_id как "order_{order_id}"
     merchant_trans_id = f"order_{order_id}"
     order_message = (
         f"💎 Новый заказ №{order_id}\n\n"
@@ -506,7 +508,7 @@ async def process_payment_sum(message: types.Message, state: FSMContext):
         await message.reply("Ошибка: номер заказа не найден.")
         await state.clear()
         return
-    cur = db_conn.cursor()
+    cur = db_conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("UPDATE orders SET status = %s, payment_amount = %s WHERE order_id = %s", ("Одобрен", int(payment_sum), order_id))
     db_conn.commit()
     cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
@@ -522,7 +524,8 @@ async def process_payment_sum(message: types.Message, state: FSMContext):
     invoice_response = create_invoice(int(payment_sum), phone_number, merchant_trans_id)
     if invoice_response.get("error_code") == 0:
         invoice_id = invoice_response.get("invoice_id")
-        payment_url = f"https://click.uz/payment/{invoice_id}"
+        # Формируем ссылку для оплаты согласно документации:
+        payment_url = f"https://api.click.uz/v2/merchant/invoice/status/{SERVICE_ID}/{invoice_id}"
         try:
             await bot.send_message(order["user_id"], f"✅ Ваш заказ №{order_id} одобрен!\nСумма: {payment_sum} сум.\nОплатите по ссылке:\n{payment_url}")
             await message.reply("Инвойс создан, ссылка отправлена клиенту.")
