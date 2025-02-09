@@ -22,10 +22,10 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# Загружаем переменные окружения
+# Загрузка переменных окружения
 load_dotenv()
 
-# Настройка логирования (stdout – логи будут видны на Render)
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -33,7 +33,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Получаем переменные из .env
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not API_TOKEN:
     raise Exception("TELEGRAM_BOT_TOKEN не определён")
@@ -53,7 +52,6 @@ GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 SELF_URL = os.getenv("SELF_URL")
 RETURN_URL = os.getenv("RETURN_URL")
 
-# Подключаемся к PostgreSQL
 try:
     db_conn = psycopg2.connect(DATABASE_URL, sslmode='require')
     db_conn.autocommit = True
@@ -63,7 +61,7 @@ except Exception as e:
     logger.error("Ошибка подключения к PostgreSQL (бот): %s", e)
     raise
 
-# Создаем таблицы
+# Создаем таблицы, если их нет
 create_clients_table = """
 CREATE TABLE IF NOT EXISTS clients (
     user_id BIGINT PRIMARY KEY,
@@ -97,7 +95,6 @@ except Exception as e:
     logger.error("Ошибка создания таблиц (бот): %s", e)
     raise
 
-# Добавляем недостающие столбцы
 try:
     db_cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_amount INTEGER;")
     db_cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS merchant_prepare_id BIGINT;")
@@ -107,13 +104,11 @@ try:
 except Exception as e:
     logger.error("Ошибка добавления столбцов: %s", e)
 
-# Создаем экземпляры хранилища, Dispatcher и Router
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-# Создаем экземпляр бота – он должен быть создан до вызова main()
 bot = Bot(
     token=API_TOKEN,
     default=DefaultBotProperties(
@@ -123,7 +118,7 @@ bot = Bot(
     )
 )
 
-# Определяем FSM для заказа
+# FSM для заказа
 class OrderForm(StatesGroup):
     contact = State()
     name = State()
@@ -134,12 +129,12 @@ class OrderForm(StatesGroup):
     location = State()
     delivery_comment = State()
 
-# FSM для управления базой (админ)
+# FSM для управления БД (админ)
 class DBManagementState(StatesGroup):
     waiting_for_client_id = State()
     waiting_for_order_id = State()
 
-# FSM для ввода суммы оплаты администратором
+# FSM для ввода суммы оплаты (админ задает цену)
 class OrderApproval(StatesGroup):
     waiting_for_payment_sum = State()
 
@@ -176,7 +171,6 @@ def generate_auth_header():
     digest = hashlib.sha1((timestamp + SECRET_KEY).encode('utf-8')).hexdigest()
     return f"{MERCHANT_USER_ID}:{digest}:{timestamp}"
 
-# Функция для создания инвойса (с заголовком Auth)
 def create_invoice(amount, phone_number, merchant_trans_id):
     url = "https://api.click.uz/v2/merchant/invoice/create"
     headers = {
@@ -198,7 +192,6 @@ def create_invoice(amount, phone_number, merchant_trans_id):
         logger.error("Ошибка запроса к Click API: %s", e)
         return {"error_code": -99, "error_note": "Ошибка запроса к Click API"}
 
-# Функция для формирования платежной ссылки
 async def create_payment_link(user_id: int, amount: int, merchant_trans_id: str) -> str:
     action = "0"
     sign_time = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -282,8 +275,6 @@ def build_fiscal_item(order):
         "VATPercent": 12,
         "CommissionInfo": product_info["CommissionInfo"]
     }
-
-# --- Обработчики бота ---
 
 @router.message(Command("start"))
 async def send_welcome(message: types.Message, state: FSMContext):
@@ -417,6 +408,7 @@ async def handle_location(message: types.Message, state: FSMContext):
 async def handle_delivery_comment(message: types.Message, state: FSMContext):
     delivery_comment = message.text.strip()
     await state.update_data(delivery_comment=delivery_comment)
+    # После оформления заказа клиенту отправляется сообщение администратору для подтверждения цены
     await send_order_to_admin(message.from_user.id, state)
 
 @router.callback_query(lambda c: c.data == 'skip_comment', StateFilter(OrderForm.delivery_comment))
@@ -486,24 +478,47 @@ async def approve_order(callback_query: types.CallbackQuery, state: FSMContext):
         await callback_query.answer("Нет прав.", show_alert=True)
         return
     # Обновляем статус заказа
-    cur = db_conn.cursor()
+    cur = db_conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Одобрен", order_id))
     db_conn.commit()
-    # Получаем данные заказа
+    # После одобрения, просим администратора указать цену
+    await state.update_data(approval_order_id=order_id)
+    await callback_query.message.answer(f"Введите цену для заказа №{order_id} (сум):")
+    await state.set_state(OrderApproval.waiting_for_payment_sum)
+
+@router.message(OrderApproval.waiting_for_payment_sum)
+async def process_payment_sum(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    try:
+        payment_sum = float(text)
+    except ValueError:
+        await message.reply("🚫 Введите корректное число (сумму).")
+        return
+    data = await state.get_data()
+    order_id = data.get("approval_order_id")
+    if not order_id:
+        await message.reply("Ошибка: номер заказа не найден.")
+        await state.clear()
+        return
+    cur = db_conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("UPDATE orders SET status = %s, payment_amount = %s WHERE order_id = %s", ("Одобрен", int(payment_sum), order_id))
+    db_conn.commit()
+    await message.reply(f"Цена для заказа №{order_id} установлена: {payment_sum} сум.")
+    # Получаем данные заказа для отправки клиенту кнопки подтверждения
     cur.execute("SELECT user_id FROM orders WHERE order_id = %s", (order_id,))
     result = cur.fetchone()
     if result:
         client_id = result["user_id"]
-        # Отправляем клиенту сообщение с кнопкой для подтверждения заказа
         builder = InlineKeyboardBuilder()
         builder.button(text="✅ Подтвердить заказ", callback_data=f"confirm_order_{order_id}")
-        await bot.send_message(client_id, "Ваш заказ одобрен. Подтвердите заказ, чтобы получить ссылку на оплату:", reply_markup=builder.as_markup())
-    await callback_query.message.edit_text(f"Заказ №{order_id} одобрен.")
+        await bot.send_message(client_id,
+                               f"Ваш заказ №{order_id} одобрен с ценой {payment_sum} сум.\nПодтвердите заказ, чтобы получить ссылку на оплату:",
+                               reply_markup=builder.as_markup())
+    await state.clear()
 
 @router.callback_query(lambda c: c.data and c.data.startswith("confirm_order_"))
 async def handle_client_confirmation(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
-    # callback_data формата confirm_order_{order_id}
     try:
         order_id = int(callback_query.data.split('_')[2])
     except Exception as e:
@@ -534,7 +549,7 @@ async def reject_order(callback_query: types.CallbackQuery):
     if admin_id not in ADMIN_CHAT_IDS:
         await callback_query.answer("Нет прав.", show_alert=True)
         return
-    cur = db_conn.cursor()
+    cur = db_conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Отклонено", order_id))
     db_conn.commit()
     cur.execute("SELECT user_id FROM orders WHERE order_id = %s", (order_id,))

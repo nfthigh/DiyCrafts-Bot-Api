@@ -11,7 +11,7 @@ import sys
 # Загрузка переменных окружения
 load_dotenv()
 
-# Настройка логирования (stdout – логи видны в Render)
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -28,95 +28,74 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL не установлена")
 
-# Подключаемся к PostgreSQL
-try:
-    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-    conn.autocommit = True
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    logger.info("Подключение к PostgreSQL выполнено успешно (payment_api).")
-except Exception as e:
-    logger.error("Ошибка подключения к БД (payment_api): %s", e)
-    raise
+# Глобальная переменная для соединения с БД
+db_conn = None
 
-# Обновляем схему: создаем таблицу orders (если её нет) и добавляем столбцы merchant_prepare_id и merchant_trans_id
-try:
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            order_id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            merchant_trans_id TEXT,
-            product TEXT,
-            quantity INTEGER,
-            design_text TEXT,
-            design_photo TEXT,
-            location_lat REAL,
-            location_lon REAL,
-            status TEXT,
-            payment_amount INTEGER,
-            order_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            delivery_comment TEXT
-        )
-    """)
-    cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS merchant_prepare_id BIGINT;")
-    cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS merchant_trans_id TEXT;")
-    conn.commit()
-    logger.info("Схема базы данных обновлена (orders).")
-except Exception as e:
-    logger.error("Ошибка обновления схемы базы данных: %s", e)
+def connect_db():
+    global db_conn
+    try:
+        db_conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+        db_conn.autocommit = True
+        logger.info("Успешное подключение к БД.")
+    except Exception as e:
+        logger.error("Ошибка подключения к БД: %s", e)
+        raise
 
-# Пример каталога товаров для фискальных данных
-products_data = {
-    "Кружка": {
-        "SPIC": "06912001036000000",
-        "PackageCode": "1184747",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Брелок": {
-        "SPIC": "07117001015000000",
-        "PackageCode": "1156259",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Кепка": {
-        "SPIC": "06506001022000000",
-        "PackageCode": "1324746",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Визитка": {
-        "SPIC": "04911001003000000",
-        "PackageCode": "1156221",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Футболка": {
-        "SPIC": "06109001001000000",
-        "PackageCode": "1124331",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Худи": {
-        "SPIC": "06212001012000000",
-        "PackageCode": "1238867",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Пазл": {
-        "SPIC": "04811001019000000",
-        "PackageCode": "1748791",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Камень": {
-        "SPIC": "04911001017000000",
-        "PackageCode": "1156234",
-        "CommissionInfo": {"TIN": "307022362"}
-    },
-    "Стакан": {
-        "SPIC": "07013001008000000",
-        "PackageCode": "1345854",
-        "CommissionInfo": {"TIN": "307022362"}
-    }
-}
+connect_db()
 
+def get_db_cursor():
+    global db_conn
+    try:
+        cursor = db_conn.cursor(cursor_factory=RealDictCursor)
+        # Пробуем выполнить простой запрос, чтобы проверить соединение
+        cursor.execute("SELECT 1")
+        return cursor
+    except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
+        logger.error("Ошибка соединения с БД, переподключаемся: %s", e)
+        try:
+            db_conn.close()
+        except Exception as ex:
+            logger.error("Ошибка закрытия соединения: %s", ex)
+        connect_db()
+        return db_conn.cursor(cursor_factory=RealDictCursor)
+
+# Создание таблицы и обновление схемы
+def init_db():
+    cursor = get_db_cursor()
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                order_id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                merchant_trans_id TEXT,
+                product TEXT,
+                quantity INTEGER,
+                design_text TEXT,
+                design_photo TEXT,
+                location_lat REAL,
+                location_lon REAL,
+                status TEXT,
+                payment_amount INTEGER,
+                order_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                delivery_comment TEXT
+            )
+        """)
+        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS merchant_prepare_id BIGINT;")
+        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS merchant_trans_id TEXT;")
+        db_conn.commit()
+        logger.info("Схема БД и таблица orders инициализированы.")
+    except Exception as e:
+        logger.error("Ошибка инициализации БД: %s", e)
+        db_conn.rollback()
+
+init_db()
+
+# Функция для вычисления MD5 подписи
 def calculate_md5(*args):
     concat_str = ''.join(str(arg) for arg in args)
     return hashlib.md5(concat_str.encode('utf-8')).hexdigest()
 
+# Формирование фискальных данных (пример)
 def build_fiscal_item(order):
     product = order.get("product")
     quantity = order.get("quantity")
@@ -125,6 +104,12 @@ def build_fiscal_item(order):
         raise ValueError("Некорректные данные заказа для фискализации.")
     unit_price = round(total_price / quantity)
     vat = round((total_price / 1.12) * 0.12)
+    # Пример: берем данные товара из статического словаря
+    products_data = {
+        "Кружка": {"SPIC": "06912001036000000", "PackageCode": "1184747", "CommissionInfo": {"TIN": "307022362"}},
+        "Брелок": {"SPIC": "07117001015000000", "PackageCode": "1156259", "CommissionInfo": {"TIN": "307022362"}}
+        # добавьте другие товары по необходимости
+    }
     product_info = products_data.get(product)
     if not product_info:
         raise ValueError(f"Нет данных для товара '{product}'.")
@@ -141,7 +126,9 @@ def build_fiscal_item(order):
         "CommissionInfo": product_info["CommissionInfo"]
     }
 
+# Функция поиска заказа по merchant_trans_id
 def extract_order_by_mti(merchant_trans_id):
+    cursor = get_db_cursor()
     cursor.execute("SELECT * FROM orders WHERE merchant_trans_id = %s", (merchant_trans_id,))
     return cursor.fetchone()
 
@@ -189,6 +176,7 @@ def click_prepare():
         return jsonify({'error': -5, 'error_note': 'Заказ не найден'}), 200
 
     merchant_prepare_id = int(time.time())
+    cursor = get_db_cursor()
     cursor.execute("UPDATE orders SET merchant_prepare_id = %s WHERE merchant_trans_id = %s", (merchant_prepare_id, data['merchant_trans_id']))
     conn.commit()
     logger.info("PREPARE: Обновлён заказ merchant_trans_id=%s, merchant_prepare_id=%s", data['merchant_trans_id'], merchant_prepare_id)
@@ -247,6 +235,7 @@ def click_complete():
         logger.error("COMPLETE: Заказ не найден или merchant_prepare_id не совпадает для merchant_trans_id=%s", data['merchant_trans_id'])
         return jsonify({'error': -6, 'error_note': 'Transaction does not exist'}), 200
 
+    cursor = get_db_cursor()
     cursor.execute("UPDATE orders SET status = %s WHERE merchant_trans_id = %s", ("paid", data['merchant_trans_id']))
     conn.commit()
     try:
