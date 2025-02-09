@@ -22,10 +22,8 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# Загружаем переменные окружения
 load_dotenv()
 
-# Настройка логирования (stdout – логи будут видны в Render)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -33,10 +31,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Получаем переменные из .env
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not API_TOKEN:
-    raise Exception("TELEGRAM_BOT_TOKEN не определён в .env")
+    raise Exception("TELEGRAM_BOT_TOKEN не определён")
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL не определена")
@@ -44,7 +41,6 @@ MERCHANT_USER_ID = os.getenv("MERCHANT_USER_ID")
 SECRET_KEY = os.getenv("SECRET_KEY")
 SERVICE_ID = os.getenv("SERVICE_ID")
 MERCHANT_ID = os.getenv("MERCHANT_ID")
-
 ADMIN_CHAT_IDS = os.getenv("ADMIN_CHAT_IDS")
 if ADMIN_CHAT_IDS:
     ADMIN_CHAT_IDS = [int(x.strip()) for x in ADMIN_CHAT_IDS.split(",") if x.strip()]
@@ -54,7 +50,6 @@ GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 SELF_URL = os.getenv("SELF_URL")
 RETURN_URL = os.getenv("RETURN_URL")
 
-# Подключаемся к PostgreSQL
 try:
     db_conn = psycopg2.connect(DATABASE_URL, sslmode='require')
     db_conn.autocommit = True
@@ -64,7 +59,6 @@ except Exception as e:
     logger.error("Ошибка подключения к PostgreSQL (бот): %s", e)
     raise
 
-# Обновленная схема таблицы orders с добавлением merchant_trans_id
 create_clients_table = """
 CREATE TABLE IF NOT EXISTS clients (
     user_id BIGINT PRIMARY KEY,
@@ -98,7 +92,6 @@ except Exception as e:
     logger.error("Ошибка создания таблиц (бот): %s", e)
     raise
 
-# Автоматически добавляем недостающие столбцы
 try:
     db_cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_amount INTEGER;")
     db_cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS merchant_prepare_id BIGINT;")
@@ -108,7 +101,6 @@ try:
 except Exception as e:
     logger.error("Ошибка добавления столбцов: %s", e)
 
-# FSM для заказа
 class OrderForm(StatesGroup):
     contact = State()
     name = State()
@@ -119,12 +111,10 @@ class OrderForm(StatesGroup):
     location = State()
     delivery_comment = State()
 
-# FSM для управления БД (админ)
 class DBManagementState(StatesGroup):
     waiting_for_client_id = State()
     waiting_for_order_id = State()
 
-# FSM для ввода суммы оплаты (при одобрении заказа)
 class OrderApproval(StatesGroup):
     waiting_for_payment_sum = State()
 
@@ -156,19 +146,17 @@ def get_product_keyboard():
     builder.adjust(2)
     return builder.as_markup()
 
-# Функция генерации заголовка для Click API (для создания инвойса)
 def generate_auth_header():
     timestamp = str(int(time.time()))
     digest = hashlib.sha1((timestamp + SECRET_KEY).encode('utf-8')).hexdigest()
     return f"{MERCHANT_USER_ID}:{digest}:{timestamp}"
 
-# Функция вызова Click API для создания инвойса
 def create_invoice(amount, phone_number, merchant_trans_id):
     url = "https://api.click.uz/v2/merchant/invoice/create"
     headers = {
         "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Auth": generate_auth_header()
+        "Content-Type": "application/json"
+        # Заголовок Auth генерируется сервером Click при вызове этого метода
     }
     payload = {
         "service_id": SERVICE_ID,
@@ -184,7 +172,6 @@ def create_invoice(amount, phone_number, merchant_trans_id):
         logger.error("Ошибка запроса к Click API: %s", e)
         return {"error_code": -99, "error_note": "Ошибка запроса к Click API"}
 
-# Пример каталога товаров (для формирования фискальных данных)
 products_data = {
     "Кружка": {
         "SPIC": "06912001036000000",
@@ -233,7 +220,6 @@ products_data = {
     }
 }
 
-# Функция формирования позиции для фискализации (пример)
 def build_fiscal_item(order):
     product = order.get("product")
     quantity = order.get("quantity")
@@ -257,22 +243,6 @@ def build_fiscal_item(order):
         "VATPercent": 12,
         "CommissionInfo": product_info["CommissionInfo"]
     }
-
-# Инициализация бота
-bot = Bot(
-    token=API_TOKEN,
-    default=DefaultBotProperties(
-        parse_mode="HTML",
-        link_preview_is_disabled=False,
-        protect_content=False
-    )
-)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
-router = Router()
-dp.include_router(router)
-
-# --- Обработчики команд и регистрация ---
 
 @router.message(Command("start"))
 async def send_welcome(message: types.Message, state: FSMContext):
@@ -420,30 +390,16 @@ async def send_order_to_admin(user_id, state: FSMContext):
     location = data.get('location')
     delivery_comment = data.get('delivery_comment') or "Не указан"
 
-    # Генерируем уникальный merchant_trans_id в виде UUID
+    # Генерируем UUID для merchant_trans_id
     merchant_trans_id = str(uuid.uuid4())
 
     cur = db_conn.cursor(cursor_factory=RealDictCursor)
-    # Сохраняем или обновляем клиента
-    cur.execute("SELECT name, contact, username FROM clients WHERE user_id = %s", (user_id,))
-    client = cur.fetchone()
-    if client:
-        user_name = client.get("name") or "Уважаемый клиент"
-        user_contact = client.get("contact") or "не указан"
-        user_username = client.get("username") or "не указан"
-    else:
-        user_name = "Уважаемый клиент"
-        user_contact = "не указан"
-        user_username = "не указан"
-
-    order_time = datetime.now().strftime('%Y-%m-%d %H:%M')
-    # При вставке заказа сохраняем сгенерированный merchant_trans_id
     cur.execute("""
         INSERT INTO orders (user_id, merchant_trans_id, product, quantity, design_text, design_photo,
             location_lat, location_lon, order_time, delivery_comment, status)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (user_id, merchant_trans_id, product, quantity, design_text, design_photo,
-          location.latitude, location.longitude, order_time, delivery_comment, "Ожидание одобрения"))
+          location.latitude, location.longitude, datetime.now().strftime('%Y-%m-%d %H:%M'), delivery_comment, "Ожидание одобрения"))
     db_conn.commit()
     cur.execute("SELECT order_id, merchant_trans_id FROM orders WHERE user_id = %s ORDER BY order_time DESC LIMIT 1", (user_id,))
     order_row = cur.fetchone()
@@ -455,7 +411,7 @@ async def send_order_to_admin(user_id, state: FSMContext):
 
     order_message = (
         f"💎 Новый заказ №{order_id}\n\n"
-        f"👤 Клиент: {user_name} (@{user_username}, {user_contact})\n"
+        f"👤 Клиент: {user_id}\n"
         f"📦 Товар: {product}\n"
         f"🔢 Количество: {quantity} шт.\n"
         f"📝 Дизайн: {design_text}\n"
@@ -512,16 +468,15 @@ async def process_payment_sum(message: types.Message, state: FSMContext):
         await message.reply("Заказ не найден в базе.")
         await state.clear()
         return
-    cur.execute("SELECT contact FROM clients WHERE user_id = %s", (order["user_id"],))
+    cur.execute("SELECT contact FROM clients WHERE user_id = %s", (order.get("user_id"),))
     client = cur.fetchone()
     phone_number = client["contact"] if client and client.get("contact") else ""
-    # Используем сохраненный merchant_trans_id из заказа
+    # Используем сохраненный merchant_trans_id
     merchant_trans_id = order.get("merchant_trans_id")
     invoice_response = create_invoice(int(payment_sum), phone_number, merchant_trans_id)
     if invoice_response.get("error_code") == 0:
         invoice_id = invoice_response.get("invoice_id")
-        # Формируем публичную ссылку для оплаты по схеме:
-        # https://my.click.uz/services/pay?service_id=<service_id>&merchant_id=<merchant_id>&amount=<amount>&transaction_param=<merchant_trans_id>&return_url=<return_url>&signature=<signature>
+        # Создаем подпись для платежной ссылки:
         action = "0"
         sign_time = time.strftime("%Y-%m-%d %H:%M:%S")
         signature_string = f"{merchant_trans_id}{SERVICE_ID}{SECRET_KEY}{payment_sum}{action}{sign_time}"

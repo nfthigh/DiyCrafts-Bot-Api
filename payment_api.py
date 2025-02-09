@@ -38,7 +38,7 @@ except Exception as e:
     logger.error("Ошибка подключения к БД (payment_api): %s", e)
     raise
 
-# Обновляем схему: создаем таблицу orders, если ее нет, и добавляем столбцы merchant_prepare_id и merchant_trans_id
+# Обновляем схему: создаем таблицу orders, если её нет, и добавляем столбцы merchant_prepare_id и merchant_trans_id
 try:
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS orders (
@@ -64,7 +64,7 @@ try:
 except Exception as e:
     logger.error("Ошибка обновления схемы базы данных: %s", e)
 
-# Каталог товаров для формирования фискальных данных (пример)
+# Пример каталога товаров для формирования фискальных данных
 products_data = {
     "Кружка": {
         "SPIC": "06912001036000000",
@@ -141,13 +141,25 @@ def build_fiscal_item(order):
         "CommissionInfo": product_info["CommissionInfo"]
     }
 
+# Для Prepare и Complete мы ищем заказ по merchant_trans_id
+def extract_order_by_mti(merchant_trans_id):
+    cursor.execute("SELECT * FROM orders WHERE merchant_trans_id = %s", (merchant_trans_id,))
+    return cursor.fetchone()
+
 @app.route('/click/prepare', methods=['POST'])
 def click_prepare():
-    data = request.get_json()
-    logger.info("Получен запрос PREPARE: %s", data)
+    try:
+        logger.info("Запрос PREPARE получен")
+        logger.info("Headers: %s", request.headers)
+        logger.info("Body: %s", request.data)
+        data = request.get_json(force=True)
+    except Exception as e:
+        logger.error("Ошибка получения JSON: %s", e)
+        return jsonify({'error': -99, 'error_note': 'Неверный JSON'}), 400
+
     required_fields = ['click_trans_id', 'service_id', 'merchant_trans_id', 'amount', 'action', 'sign_time', 'sign_string']
     if not all(field in data for field in required_fields):
-        logger.error("PREPARE: Отсутствуют обязательные параметры")
+        logger.error("PREPARE: Отсутствуют обязательные параметры. Данные: %s", data)
         return jsonify({'error': -8, 'error_note': 'Отсутствуют обязательные параметры'}), 400
 
     calc_sign = calculate_md5(
@@ -160,12 +172,10 @@ def click_prepare():
         data['sign_time']
     )
     if calc_sign != data['sign_string']:
-        logger.error("PREPARE: SIGN CHECK FAILED!")
+        logger.error("PREPARE: SIGN CHECK FAILED! Вычисленная подпись: %s, полученная: %s", calc_sign, data['sign_string'])
         return jsonify({'error': -1, 'error_note': 'SIGN CHECK FAILED!'}), 400
 
-    # Поиск заказа по merchant_trans_id (уже в формате UUID)
-    cursor.execute("SELECT * FROM orders WHERE merchant_trans_id = %s", (data['merchant_trans_id'],))
-    order = cursor.fetchone()
+    order = extract_order_by_mti(data['merchant_trans_id'])
     if not order:
         logger.error("PREPARE: Заказ не найден для merchant_trans_id=%s", data['merchant_trans_id'])
         return jsonify({'error': -5, 'error_note': 'Заказ не найден'}), 200
@@ -173,7 +183,7 @@ def click_prepare():
     merchant_prepare_id = int(time.time())
     cursor.execute("UPDATE orders SET merchant_prepare_id = %s WHERE merchant_trans_id = %s", (merchant_prepare_id, data['merchant_trans_id']))
     conn.commit()
-    logger.info("PREPARE: Обновлён заказ с merchant_trans_id=%s, merchant_prepare_id=%s", data['merchant_trans_id'], merchant_prepare_id)
+    logger.info("PREPARE: Обновлён заказ merchant_trans_id=%s, merchant_prepare_id=%s", data['merchant_trans_id'], merchant_prepare_id)
 
     response = {
         'click_trans_id': data['click_trans_id'],
@@ -187,11 +197,18 @@ def click_prepare():
 
 @app.route('/click/complete', methods=['POST'])
 def click_complete():
-    data = request.get_json()
-    logger.info("Получен запрос COMPLETE: %s", data)
+    try:
+        logger.info("Запрос COMPLETE получен")
+        logger.info("Headers: %s", request.headers)
+        logger.info("Body: %s", request.data)
+        data = request.get_json(force=True)
+    except Exception as e:
+        logger.error("Ошибка получения JSON: %s", e)
+        return jsonify({'error': -99, 'error_note': 'Неверный JSON'}), 400
+
     required_fields = ['click_trans_id', 'service_id', 'merchant_trans_id', 'merchant_prepare_id', 'amount', 'action', 'sign_time', 'sign_string']
     if not all(field in data for field in required_fields):
-        logger.error("COMPLETE: Отсутствуют обязательные параметры")
+        logger.error("COMPLETE: Отсутствуют обязательные параметры. Данные: %s", data)
         return jsonify({'error': -8, 'error_note': 'Отсутствуют обязательные параметры'}), 400
 
     calc_sign = calculate_md5(
@@ -205,12 +222,10 @@ def click_complete():
         data['sign_time']
     )
     if calc_sign != data['sign_string']:
-        logger.error("COMPLETE: SIGN CHECK FAILED!")
+        logger.error("COMPLETE: SIGN CHECK FAILED! Вычисленная подпись: %s, полученная: %s", calc_sign, data['sign_string'])
         return jsonify({'error': -1, 'error_note': 'SIGN CHECK FAILED!'}), 400
 
-    # Поиск заказа по merchant_trans_id
-    cursor.execute("SELECT * FROM orders WHERE merchant_trans_id = %s", (data['merchant_trans_id'],))
-    order = cursor.fetchone()
+    order = extract_order_by_mti(data['merchant_trans_id'])
     if not order or order.get("merchant_prepare_id") != data['merchant_prepare_id']:
         logger.error("COMPLETE: Заказ не найден или merchant_prepare_id не совпадает для merchant_trans_id=%s", data['merchant_trans_id'])
         return jsonify({'error': -6, 'error_note': 'Transaction does not exist'}), 200
