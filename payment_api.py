@@ -11,7 +11,7 @@ import sys
 # Загрузка переменных окружения
 load_dotenv()
 
-# Настройка логирования
+# Настройка логирования (stdout – логи выводятся, например, в Render)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -28,7 +28,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL не установлена")
 
-# Глобальная переменная для соединения с БД
+# Глобальная переменная для подключения к БД
 db_conn = None
 
 def connect_db():
@@ -47,7 +47,6 @@ def get_db_cursor():
     global db_conn
     try:
         cursor = db_conn.cursor(cursor_factory=RealDictCursor)
-        # Пробуем выполнить простой запрос, чтобы проверить соединение
         cursor.execute("SELECT 1")
         return cursor
     except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
@@ -59,7 +58,6 @@ def get_db_cursor():
         connect_db()
         return db_conn.cursor(cursor_factory=RealDictCursor)
 
-# Создание таблицы и обновление схемы
 def init_db():
     cursor = get_db_cursor()
     try:
@@ -90,12 +88,10 @@ def init_db():
 
 init_db()
 
-# Функция для вычисления MD5 подписи
 def calculate_md5(*args):
     concat_str = ''.join(str(arg) for arg in args)
     return hashlib.md5(concat_str.encode('utf-8')).hexdigest()
 
-# Формирование фискальных данных (пример)
 def build_fiscal_item(order):
     product = order.get("product")
     quantity = order.get("quantity")
@@ -104,11 +100,10 @@ def build_fiscal_item(order):
         raise ValueError("Некорректные данные заказа для фискализации.")
     unit_price = round(total_price / quantity)
     vat = round((total_price / 1.12) * 0.12)
-    # Пример: берем данные товара из статического словаря
+    # Пример данных товаров (расширьте по необходимости)
     products_data = {
         "Кружка": {"SPIC": "06912001036000000", "PackageCode": "1184747", "CommissionInfo": {"TIN": "307022362"}},
         "Брелок": {"SPIC": "07117001015000000", "PackageCode": "1156259", "CommissionInfo": {"TIN": "307022362"}}
-        # добавьте другие товары по необходимости
     }
     product_info = products_data.get(product)
     if not product_info:
@@ -126,7 +121,6 @@ def build_fiscal_item(order):
         "CommissionInfo": product_info["CommissionInfo"]
     }
 
-# Функция поиска заказа по merchant_trans_id
 def extract_order_by_mti(merchant_trans_id):
     cursor = get_db_cursor()
     cursor.execute("SELECT * FROM orders WHERE merchant_trans_id = %s", (merchant_trans_id,))
@@ -178,7 +172,7 @@ def click_prepare():
     merchant_prepare_id = int(time.time())
     cursor = get_db_cursor()
     cursor.execute("UPDATE orders SET merchant_prepare_id = %s WHERE merchant_trans_id = %s", (merchant_prepare_id, data['merchant_trans_id']))
-    conn.commit()
+    db_conn.commit()  # Используем db_conn.commit(), а не conn.commit()
     logger.info("PREPARE: Обновлён заказ merchant_trans_id=%s, merchant_prepare_id=%s", data['merchant_trans_id'], merchant_prepare_id)
 
     response = {
@@ -237,7 +231,7 @@ def click_complete():
 
     cursor = get_db_cursor()
     cursor.execute("UPDATE orders SET status = %s WHERE merchant_trans_id = %s", ("paid", data['merchant_trans_id']))
-    conn.commit()
+    db_conn.commit()
     try:
         fiscal_item = build_fiscal_item(order)
     except Exception as e:

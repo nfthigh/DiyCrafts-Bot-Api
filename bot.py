@@ -25,7 +25,6 @@ from psycopg2.extras import RealDictCursor
 # Загрузка переменных окружения
 load_dotenv()
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -61,7 +60,6 @@ except Exception as e:
     logger.error("Ошибка подключения к PostgreSQL (бот): %s", e)
     raise
 
-# Создаем таблицы, если их нет
 create_clients_table = """
 CREATE TABLE IF NOT EXISTS clients (
     user_id BIGINT PRIMARY KEY,
@@ -276,6 +274,8 @@ def build_fiscal_item(order):
         "CommissionInfo": product_info["CommissionInfo"]
     }
 
+# --- Обработчики бота ---
+
 @router.message(Command("start"))
 async def send_welcome(message: types.Message, state: FSMContext):
     await state.clear()
@@ -408,7 +408,7 @@ async def handle_location(message: types.Message, state: FSMContext):
 async def handle_delivery_comment(message: types.Message, state: FSMContext):
     delivery_comment = message.text.strip()
     await state.update_data(delivery_comment=delivery_comment)
-    # После оформления заказа клиенту отправляется сообщение администратору для подтверждения цены
+    # После оформления заказа отправляем уведомление администратору для ввода цены
     await send_order_to_admin(message.from_user.id, state)
 
 @router.callback_query(lambda c: c.data == 'skip_comment', StateFilter(OrderForm.delivery_comment))
@@ -481,7 +481,7 @@ async def approve_order(callback_query: types.CallbackQuery, state: FSMContext):
     cur = db_conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("Одобрен", order_id))
     db_conn.commit()
-    # После одобрения, просим администратора указать цену
+    # После одобрения просим администратора указать цену
     await state.update_data(approval_order_id=order_id)
     await callback_query.message.answer(f"Введите цену для заказа №{order_id} (сум):")
     await state.set_state(OrderApproval.waiting_for_payment_sum)
@@ -504,7 +504,6 @@ async def process_payment_sum(message: types.Message, state: FSMContext):
     cur.execute("UPDATE orders SET status = %s, payment_amount = %s WHERE order_id = %s", ("Одобрен", int(payment_sum), order_id))
     db_conn.commit()
     await message.reply(f"Цена для заказа №{order_id} установлена: {payment_sum} сум.")
-    # Получаем данные заказа для отправки клиенту кнопки подтверждения
     cur.execute("SELECT user_id FROM orders WHERE order_id = %s", (order_id,))
     result = cur.fetchone()
     if result:
