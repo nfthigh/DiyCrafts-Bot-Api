@@ -4,6 +4,7 @@ import logging
 import asyncio
 import hashlib
 import time
+import uuid
 from datetime import datetime
 from dotenv import load_dotenv
 import requests
@@ -21,10 +22,10 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# Загрузка переменных окружения
+# Загружаем переменные окружения
 load_dotenv()
 
-# Настройка логирования (логи выводятся в stdout, которые видны на Render)
+# Настройка логирования (stdout – логи будут видны в Render)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -51,6 +52,7 @@ else:
     ADMIN_CHAT_IDS = []
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 SELF_URL = os.getenv("SELF_URL")
+RETURN_URL = os.getenv("RETURN_URL")
 
 # Подключаемся к PostgreSQL
 try:
@@ -62,7 +64,7 @@ except Exception as e:
     logger.error("Ошибка подключения к PostgreSQL (бот): %s", e)
     raise
 
-# Создаем таблицы, если их нет
+# Обновленная схема таблицы orders с добавлением merchant_trans_id
 create_clients_table = """
 CREATE TABLE IF NOT EXISTS clients (
     user_id BIGINT PRIMARY KEY,
@@ -75,6 +77,7 @@ create_orders_table = """
 CREATE TABLE IF NOT EXISTS orders (
     order_id SERIAL PRIMARY KEY,
     user_id BIGINT,
+    merchant_trans_id TEXT,
     product TEXT,
     quantity INTEGER,
     design_text TEXT,
@@ -99,12 +102,13 @@ except Exception as e:
 try:
     db_cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_amount INTEGER;")
     db_cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS merchant_prepare_id BIGINT;")
+    db_cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS merchant_trans_id TEXT;")
     db_conn.commit()
-    logger.info("Столбцы payment_amount и merchant_prepare_id проверены/созданы (бот).")
+    logger.info("Столбцы payment_amount, merchant_prepare_id и merchant_trans_id проверены/созданы (бот).")
 except Exception as e:
     logger.error("Ошибка добавления столбцов: %s", e)
 
-# Определяем FSM для заказа
+# FSM для заказа
 class OrderForm(StatesGroup):
     contact = State()
     name = State()
@@ -180,7 +184,7 @@ def create_invoice(amount, phone_number, merchant_trans_id):
         logger.error("Ошибка запроса к Click API: %s", e)
         return {"error_code": -99, "error_note": "Ошибка запроса к Click API"}
 
-# Каталог товаров для формирования фискальных данных (пример)
+# Пример каталога товаров (для формирования фискальных данных)
 products_data = {
     "Кружка": {
         "SPIC": "06912001036000000",
@@ -416,7 +420,11 @@ async def send_order_to_admin(user_id, state: FSMContext):
     location = data.get('location')
     delivery_comment = data.get('delivery_comment') or "Не указан"
 
+    # Генерируем уникальный merchant_trans_id в виде UUID
+    merchant_trans_id = str(uuid.uuid4())
+
     cur = db_conn.cursor(cursor_factory=RealDictCursor)
+    # Сохраняем или обновляем клиента
     cur.execute("SELECT name, contact, username FROM clients WHERE user_id = %s", (user_id,))
     client = cur.fetchone()
     if client:
@@ -429,22 +437,22 @@ async def send_order_to_admin(user_id, state: FSMContext):
         user_username = "не указан"
 
     order_time = datetime.now().strftime('%Y-%m-%d %H:%M')
+    # При вставке заказа сохраняем сгенерированный merchant_trans_id
     cur.execute("""
-        INSERT INTO orders (user_id, product, quantity, design_text, design_photo,
+        INSERT INTO orders (user_id, merchant_trans_id, product, quantity, design_text, design_photo,
             location_lat, location_lon, order_time, delivery_comment, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (user_id, product, quantity, design_text, design_photo,
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (user_id, merchant_trans_id, product, quantity, design_text, design_photo,
           location.latitude, location.longitude, order_time, delivery_comment, "Ожидание одобрения"))
     db_conn.commit()
-    cur.execute("SELECT order_id FROM orders WHERE user_id = %s ORDER BY order_time DESC LIMIT 1", (user_id,))
+    cur.execute("SELECT order_id, merchant_trans_id FROM orders WHERE user_id = %s ORDER BY order_time DESC LIMIT 1", (user_id,))
     order_row = cur.fetchone()
     order_id = order_row["order_id"] if order_row else None
+    merchant_trans_id = order_row["merchant_trans_id"] if order_row else merchant_trans_id
     if not order_id:
         await bot.send_message(user_id, "🚫 Ошибка при создании заказа.")
         return
 
-    # Формируем merchant_trans_id как "order_{order_id}"
-    merchant_trans_id = f"order_{order_id}"
     order_message = (
         f"💎 Новый заказ №{order_id}\n\n"
         f"👤 Клиент: {user_name} (@{user_username}, {user_contact})\n"
@@ -507,17 +515,17 @@ async def process_payment_sum(message: types.Message, state: FSMContext):
     cur.execute("SELECT contact FROM clients WHERE user_id = %s", (order["user_id"],))
     client = cur.fetchone()
     phone_number = client["contact"] if client and client.get("contact") else ""
-    merchant_trans_id = f"order_{order_id}"
+    # Используем сохраненный merchant_trans_id из заказа
+    merchant_trans_id = order.get("merchant_trans_id")
     invoice_response = create_invoice(int(payment_sum), phone_number, merchant_trans_id)
     if invoice_response.get("error_code") == 0:
         invoice_id = invoice_response.get("invoice_id")
-        # Формирование публичной ссылки для оплаты по заданной схеме:
+        # Формируем публичную ссылку для оплаты по схеме:
         # https://my.click.uz/services/pay?service_id=<service_id>&merchant_id=<merchant_id>&amount=<amount>&transaction_param=<merchant_trans_id>&return_url=<return_url>&signature=<signature>
         action = "0"
         sign_time = time.strftime("%Y-%m-%d %H:%M:%S")
         signature_string = f"{merchant_trans_id}{SERVICE_ID}{SECRET_KEY}{payment_sum}{action}{sign_time}"
         signature = hashlib.md5(signature_string.encode('utf-8')).hexdigest()
-        RETURN_URL = os.getenv("RETURN_URL")
         payment_url = (
             f"https://my.click.uz/services/pay?"
             f"service_id={SERVICE_ID}&merchant_id={MERCHANT_ID}&amount={payment_sum}"

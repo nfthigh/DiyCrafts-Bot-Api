@@ -11,7 +11,7 @@ import sys
 # Загрузка переменных окружения
 load_dotenv()
 
-# Настройка логирования (stdout – логи видны на Render)
+# Настройка логирования (stdout – логи видны в Render)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -38,12 +38,13 @@ except Exception as e:
     logger.error("Ошибка подключения к БД (payment_api): %s", e)
     raise
 
-# Обновляем схему: создаем таблицу orders, если её нет, и добавляем столбец merchant_prepare_id
+# Обновляем схему: создаем таблицу orders, если ее нет, и добавляем столбцы merchant_prepare_id и merchant_trans_id
 try:
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             order_id SERIAL PRIMARY KEY,
             user_id BIGINT,
+            merchant_trans_id TEXT,
             product TEXT,
             quantity INTEGER,
             design_text TEXT,
@@ -57,6 +58,7 @@ try:
         )
     """)
     cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS merchant_prepare_id BIGINT;")
+    cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS merchant_trans_id TEXT;")
     conn.commit()
     logger.info("Схема базы данных обновлена (orders).")
 except Exception as e:
@@ -139,14 +141,6 @@ def build_fiscal_item(order):
         "CommissionInfo": product_info["CommissionInfo"]
     }
 
-def extract_order_id(merchant_trans_id):
-    if not merchant_trans_id.startswith("order_"):
-        return None
-    try:
-        return int(merchant_trans_id.split("_")[1])
-    except Exception:
-        return None
-
 @app.route('/click/prepare', methods=['POST'])
 def click_prepare():
     data = request.get_json()
@@ -169,21 +163,17 @@ def click_prepare():
         logger.error("PREPARE: SIGN CHECK FAILED!")
         return jsonify({'error': -1, 'error_note': 'SIGN CHECK FAILED!'}), 400
 
-    order_id = extract_order_id(data['merchant_trans_id'])
-    if not order_id:
-        logger.error("PREPARE: Некорректный merchant_trans_id")
-        return jsonify({'error': -5, 'error_note': 'Некорректный merchant_trans_id'}), 200
-
-    cursor.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
+    # Поиск заказа по merchant_trans_id (уже в формате UUID)
+    cursor.execute("SELECT * FROM orders WHERE merchant_trans_id = %s", (data['merchant_trans_id'],))
     order = cursor.fetchone()
     if not order:
-        logger.error("PREPARE: Заказ не найден для order_id=%s", order_id)
+        logger.error("PREPARE: Заказ не найден для merchant_trans_id=%s", data['merchant_trans_id'])
         return jsonify({'error': -5, 'error_note': 'Заказ не найден'}), 200
 
     merchant_prepare_id = int(time.time())
-    cursor.execute("UPDATE orders SET merchant_prepare_id = %s WHERE order_id = %s", (merchant_prepare_id, order_id))
+    cursor.execute("UPDATE orders SET merchant_prepare_id = %s WHERE merchant_trans_id = %s", (merchant_prepare_id, data['merchant_trans_id']))
     conn.commit()
-    logger.info("PREPARE: Обновлён заказ %s с merchant_prepare_id=%s", order_id, merchant_prepare_id)
+    logger.info("PREPARE: Обновлён заказ с merchant_trans_id=%s, merchant_prepare_id=%s", data['merchant_trans_id'], merchant_prepare_id)
 
     response = {
         'click_trans_id': data['click_trans_id'],
@@ -218,18 +208,14 @@ def click_complete():
         logger.error("COMPLETE: SIGN CHECK FAILED!")
         return jsonify({'error': -1, 'error_note': 'SIGN CHECK FAILED!'}), 400
 
-    order_id = extract_order_id(data['merchant_trans_id'])
-    if not order_id:
-        logger.error("COMPLETE: Некорректный merchant_trans_id")
-        return jsonify({'error': -5, 'error_note': 'Некорректный merchant_trans_id'}), 200
-
-    cursor.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
+    # Поиск заказа по merchant_trans_id
+    cursor.execute("SELECT * FROM orders WHERE merchant_trans_id = %s", (data['merchant_trans_id'],))
     order = cursor.fetchone()
     if not order or order.get("merchant_prepare_id") != data['merchant_prepare_id']:
-        logger.error("COMPLETE: Заказ не найден или merchant_prepare_id не совпадает для order_id=%s", order_id)
+        logger.error("COMPLETE: Заказ не найден или merchant_prepare_id не совпадает для merchant_trans_id=%s", data['merchant_trans_id'])
         return jsonify({'error': -6, 'error_note': 'Transaction does not exist'}), 200
 
-    cursor.execute("UPDATE orders SET status = %s WHERE order_id = %s", ("paid", order_id))
+    cursor.execute("UPDATE orders SET status = %s WHERE merchant_trans_id = %s", ("paid", data['merchant_trans_id']))
     conn.commit()
     try:
         fiscal_item = build_fiscal_item(order)
