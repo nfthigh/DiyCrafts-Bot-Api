@@ -8,6 +8,7 @@ from psycopg2.extras import RealDictCursor
 import logging
 import sys
 import requests  # Для отправки запросов к Telegram API
+import threading  # Для автопинга
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -96,7 +97,9 @@ init_db()
 
 def calculate_md5(*args):
     concat_str = ''.join(str(arg) for arg in args)
-    return hashlib.md5(concat_str.encode('utf-8')).hexdigest()
+    md5_hash = hashlib.md5(concat_str.encode('utf-8')).hexdigest()
+    logger.info("Вычисленная MD5 подпись для %s: %s", concat_str, md5_hash)
+    return md5_hash
 
 def build_fiscal_item(order):
     product = order.get("product")
@@ -106,7 +109,6 @@ def build_fiscal_item(order):
         raise ValueError("Некорректные данные заказа для фискализации.")
     unit_price = round(total_price / quantity)
     vat = round((total_price / 1.12) * 0.12)
-    # Пример данных товаров – расширьте по необходимости
     products_data = {
         "Кружка": {
             "SPIC": "06912001036000000",
@@ -122,7 +124,7 @@ def build_fiscal_item(order):
     product_info = products_data.get(product)
     if not product_info:
         raise ValueError(f"Нет данных для товара '{product}'.")
-    return {
+    fiscal = {
         "Name": f"{product} (шт)",
         "SPIC": product_info["SPIC"],
         "Units": 1,
@@ -134,11 +136,15 @@ def build_fiscal_item(order):
         "VATPercent": 12,
         "CommissionInfo": product_info["CommissionInfo"]
     }
+    logger.info("Фискальные данные сформированы: %s", fiscal)
+    return fiscal
 
 def extract_order_by_mti(merchant_trans_id):
     cursor = get_db_cursor()
     cursor.execute("SELECT * FROM orders WHERE merchant_trans_id = %s", (merchant_trans_id,))
-    return cursor.fetchone()
+    order = cursor.fetchone()
+    logger.info("Извлечён заказ для merchant_trans_id=%s: %s", merchant_trans_id, order)
+    return order
 
 def get_request_data():
     try:
@@ -150,15 +156,13 @@ def get_request_data():
             data = {}
         if not data:
             data = request.args.to_dict()
+        logger.info("Полученные данные запроса: %s", data)
         return data
     except Exception as e:
         logger.error("Ошибка получения данных: %s", e)
         return {}
 
 def send_telegram_message(chat_id, text):
-    """
-    Отправляет сообщение в Telegram через API бота.
-    """
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN не установлен")
         return
@@ -288,6 +292,7 @@ def click_complete():
         if GROUP_CHAT_ID:
             send_telegram_message(GROUP_CHAT_ID, message_text)
         send_telegram_message(order["user_id"], message_text)
+        logger.info("COMPLETE: Уведомления отправлены: %s", message_text)
     else:
         logger.error("COMPLETE: Не удалось получить данные заказа для уведомлений.")
     # --- /Отправка уведомлений в Telegram ---
@@ -308,6 +313,23 @@ def click_complete():
     }
     logger.info("COMPLETE: Ответ: %s", response)
     return jsonify(response), 200
+
+# Функция автопинга для Render.com
+def auto_ping():
+    auto_ping_url = os.getenv("AUTO_PING_URL")
+    if not auto_ping_url:
+        logger.warning("AUTO_PING_URL не задан. Автопинг не запущен.")
+        return
+    while True:
+        try:
+            response = requests.get(auto_ping_url)
+            logger.info("Автопинг: запрос к %s выполнен успешно. Код ответа: %s", auto_ping_url, response.status_code)
+        except Exception as e:
+            logger.error("Ошибка автопинга: %s", e)
+        time.sleep(300)  # каждые 5 минут
+
+# Запускаем автопинг в фоновом потоке
+threading.Thread(target=auto_ping, daemon=True).start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
