@@ -7,6 +7,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import logging
 import sys
+import requests  # Для отправки запросов к Telegram API
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -27,6 +28,10 @@ SERVICE_ID = os.getenv("SERVICE_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL не установлена")
+
+# Читаем токен бота и chat_id группы (если требуется)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")  # Если группа не используется, можно оставить пустым
 
 # Глобальная переменная подключения к БД
 db_conn = None
@@ -78,6 +83,7 @@ def init_db():
                 delivery_comment TEXT
             )
         """)
+        # Дополнительные столбцы для Click
         cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS merchant_prepare_id BIGINT;")
         cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS merchant_trans_id TEXT;")
         db_conn.commit()
@@ -102,8 +108,16 @@ def build_fiscal_item(order):
     vat = round((total_price / 1.12) * 0.12)
     # Пример данных товаров – расширьте по необходимости
     products_data = {
-        "Кружка": {"SPIC": "06912001036000000", "PackageCode": "1184747", "CommissionInfo": {"TIN": "307022362"}},
-        "Брелок": {"SPIC": "07117001015000000", "PackageCode": "1156259", "CommissionInfo": {"TIN": "307022362"}}
+        "Кружка": {
+            "SPIC": "06912001036000000",
+            "PackageCode": "1184747",
+            "CommissionInfo": {"TIN": "307022362"}
+        },
+        "Брелок": {
+            "SPIC": "07117001015000000",
+            "PackageCode": "1156259",
+            "CommissionInfo": {"TIN": "307022362"}
+        }
     }
     product_info = products_data.get(product)
     if not product_info:
@@ -126,7 +140,6 @@ def extract_order_by_mti(merchant_trans_id):
     cursor.execute("SELECT * FROM orders WHERE merchant_trans_id = %s", (merchant_trans_id,))
     return cursor.fetchone()
 
-# Универсальная функция для получения данных запроса (из JSON, form или query string)
 def get_request_data():
     try:
         if request.content_type and request.content_type.startswith("application/json"):
@@ -141,6 +154,25 @@ def get_request_data():
     except Exception as e:
         logger.error("Ошибка получения данных: %s", e)
         return {}
+
+def send_telegram_message(chat_id, text):
+    """
+    Отправляет сообщение в Telegram через API бота.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN не установлен")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    try:
+        response = requests.post(url, data=payload)
+        logger.info("Отправлено сообщение в Telegram (chat_id=%s): %s", chat_id, response.text)
+    except Exception as e:
+        logger.error("Ошибка отправки сообщения в Telegram: %s", e)
 
 @app.route('/click/prepare', methods=['POST'])
 def click_prepare():
@@ -213,7 +245,6 @@ def click_complete():
         logger.error("COMPLETE: SIGN CHECK FAILED! Вычисленная: %s, полученная: %s", calc_sign, data['sign_string'])
         return jsonify({'error': -1, 'error_note': 'SIGN CHECK FAILED!'}), 400
     order = extract_order_by_mti(data['merchant_trans_id'])
-    # Приводим оба значения к int для сравненияя
     try:
         db_prepare = int(order.get("merchant_prepare_id"))
         req_prepare = int(data['merchant_prepare_id'])
@@ -223,9 +254,44 @@ def click_complete():
     if not order or db_prepare != req_prepare:
         logger.error("COMPLETE: Заказ не найден или merchant_prepare_id не совпадает для merchant_trans_id=%s", data['merchant_trans_id'])
         return jsonify({'error': -6, 'error_note': 'Transaction does not exist'}), 200
+
+    # Обновляем статус заказа на "paid"
     cursor = get_db_cursor()
     cursor.execute("UPDATE orders SET status = %s WHERE merchant_trans_id = %s", ("paid", data['merchant_trans_id']))
     db_conn.commit()
+    logger.info("COMPLETE: Статус заказа обновлён на paid для merchant_trans_id=%s", data['merchant_trans_id'])
+
+    # --- Отправка уведомлений в Telegram ---
+    cursor = get_db_cursor()
+    cursor.execute("SELECT * FROM orders WHERE merchant_trans_id = %s", (data['merchant_trans_id'],))
+    order = cursor.fetchone()
+
+    if order:
+        cursor.execute("SELECT * FROM clients WHERE user_id = %s", (order["user_id"],))
+        client = cursor.fetchone()
+
+        client_name = client.get("name", "Неизвестный") if client else "Неизвестный"
+        client_username = client.get("username", "") if client else ""
+        client_contact = client.get("contact", "Не указан") if client else "Не указан"
+        username_display = f" (@{client_username})" if client_username else ""
+
+        message_text = (
+            f"✅ Оплата заказа №{order['order_id']} успешно проведена!\n\n"
+            f"Клиент: {client_name}{username_display}\n"
+            f"Телефон: {client_contact}\n\n"
+            f"Товар: {order['product']}\n"
+            f"Количество: {order['quantity']} шт.\n"
+            f"Сумма: {order['payment_amount']} сум\n"
+            f"Комментарий к доставке: {order['delivery_comment']}"
+        )
+
+        if GROUP_CHAT_ID:
+            send_telegram_message(GROUP_CHAT_ID, message_text)
+        send_telegram_message(order["user_id"], message_text)
+    else:
+        logger.error("COMPLETE: Не удалось получить данные заказа для уведомлений.")
+    # --- /Отправка уведомлений в Telegram ---
+
     try:
         fiscal_item = build_fiscal_item(order)
     except Exception as e:
